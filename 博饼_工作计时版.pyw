@@ -195,6 +195,7 @@ class WorkCredits:
     work_seconds: int = 0
     manual_added: int = 0
     spent: int = 0
+    reset_at: str | None = None
 
     def validate(self) -> None:
         if type(self.minutes_per_roll) is not int or not 1 <= self.minutes_per_roll <= 100000:
@@ -202,6 +203,16 @@ class WorkCredits:
         for value in (self.work_seconds, self.manual_added, self.spent):
             if type(value) is not int or value < 0:
                 raise ValueError("工作时长或博饼次数存档无效。")
+        if self.reset_at is not None:
+            if not isinstance(self.reset_at, str):
+                raise ValueError("工作兑换统计的重设时间无效。")
+            parse_utc(self.reset_at)
+
+    def reset(self, at) -> None:
+        timestamp = at.isoformat()
+        parse_utc(timestamp)
+        self.work_seconds = self.manual_added = self.spent = 0
+        self.reset_at = timestamp
 
     @property
     def earned(self) -> int:
@@ -438,10 +449,18 @@ class ActivityTimeline:
                            "start_utc": cursor.isoformat(), "end_utc": now.isoformat()})
         return result
 
-    def work_seconds(self, now):
-        return sum(int((parse_utc(event["end_utc"]) - parse_utc(event["start_utc"])).total_seconds())
-                   for event in self.intervals(now)
-                   if self.catalog.settings.get(event["option_name"], {}).get("work", False))
+    def work_seconds(self, now, since=None):
+        cutoff = parse_utc(since) if isinstance(since, str) else since
+        seconds = 0
+        for event in self.intervals(now):
+            if not self.catalog.settings.get(event["option_name"], {}).get("work", False):
+                continue
+            start, end = parse_utc(event["start_utc"]), parse_utc(event["end_utc"])
+            if cutoff is not None:
+                start = max(start, cutoff)
+            if end > start:
+                seconds += int((end - start).total_seconds())
+        return seconds
 
     def finalize(self, now):
         identifier = None
@@ -543,10 +562,14 @@ class ActivityTimeline:
         self.get(identifier)
         self._commit([event for event in self.events if event["id"] != identifier], now)
 
-    def to_dict(self, now):
-        return {"version": 2, "started_utc": self.started_utc, "events": [dict(event) for event in self.events],
+    def to_dict(self, now, credit_since=None):
+        data = {"version": 2, "started_utc": self.started_utc, "events": [dict(event) for event in self.events],
                 "current_option": self.current_option, "current_start": self.current_start,
                 "checkpoint_utc": now.isoformat(), "accounted_seconds": self.work_seconds(now)}
+        if credit_since is not None:
+            data["credit_reset_at"] = credit_since
+            data["credit_accounted_seconds"] = self.work_seconds(now, credit_since)
+        return data
 
     @classmethod
     def from_dict(cls, data, catalog=None):
@@ -567,6 +590,12 @@ class ActivityTimeline:
             accounted = data["accounted_seconds"]
             if type(accounted) is not int or accounted < 0:
                 raise ValueError("已结算工作时间无效。")
+            credited = data.get("credit_accounted_seconds", accounted)
+            if type(credited) is not int or not 0 <= credited <= accounted:
+                raise ValueError("已结算兑换工作时间无效。")
+            reset_at = data.get("credit_reset_at")
+            if reset_at is not None and parse_utc(reset_at) > checkpoint:
+                raise ValueError("统计重设时间不能晚于保存时间。")
             return result
         except (KeyError, TypeError, AttributeError) as error:
             raise ValueError("活动时间轴存档格式无效。") from error
@@ -618,7 +647,9 @@ class ActivityTrackerApp:
             checkpoint = parse_utc(saved["checkpoint_utc"])
             # 只结算上次已经保存的活动时间；程序关闭期间自动呈现为空档。
             self.timeline.finalize(checkpoint)
-            host.work_accounted_seconds = saved["accounted_seconds"]
+            host.work_accounted_seconds = saved.get("credit_accounted_seconds",
+                self.timeline.work_seconds(checkpoint, host.game.work.reset_at) if host.game.work.reset_at
+                else saved["accounted_seconds"])
         elif self.autosave_path.exists():
             self._import_legacy_session()
         self.selected_var = tk.StringVar(value="未选择活动")
@@ -667,10 +698,16 @@ class ActivityTrackerApp:
                 timeline = ActivityTimeline(min(parse_utc(item["start_utc"]) for item in events), self.catalog)
                 timeline.events = sorted(events, key=lambda item: parse_utc(item["start_utc"]))
                 checkpoint = max(checkpoint, max(parse_utc(item["end_utc"]) for item in events))
-            seconds = timeline.work_seconds(checkpoint)
+            credits = self.host.game.work
+            if (data.get("work") is not None and credits.reset_at is None
+                    and credits.work_seconds == credits.manual_added == credits.spent == 0):
+                credits = WorkCredits(**data["work"])
+                credits.validate()
+                self.host.game.work = credits
+            seconds = timeline.work_seconds(checkpoint, credits.reset_at)
             self.timeline = timeline
-            self.host.work_accounted_seconds = seconds
-            self.host.game.work.work_seconds = max(self.host.game.work.work_seconds, seconds)
+            self.host.work_accounted_seconds = data.get("credit_accounted_seconds", seconds)
+            credits.work_seconds = max(credits.work_seconds, seconds)
         except (ValueError, KeyError, TypeError, OSError) as error:
             # 不覆盖无法识别的旧明细，避免在启动时丢失可修复的数据。
             raise ValueError(f"无法导入工作计时明细：{self.autosave_path}\n{error}") from error
@@ -729,8 +766,12 @@ class ActivityTrackerApp:
         ttk.Label(quota_row, text="每工作", style="Card.TLabel").pack(side="left")
         ttk.Spinbox(quota_row, from_=1, to=100000, width=6, textvariable=self.quota_var).pack(side="left", padx=self.px(6))
         ttk.Label(quota_row, text="分钟，博饼一次", style="Card.TLabel").pack(side="left")
-        ttk.Button(chance_card, text="保存工作兑换设置", style="Green.TButton", command=self.host.save_work_config).pack(
-            anchor="w", pady=self.px((4, 10)))
+        quota_buttons = ttk.Frame(chance_card, style="Card.TFrame")
+        quota_buttons.pack(fill="x", pady=self.px((4, 10)))
+        ttk.Button(quota_buttons, text="保存工作兑换设置", style="Green.TButton",
+                   command=self.host.save_work_config).pack(side="left")
+        self.reset_credits_button = ttk.Button(quota_buttons, text="重设", command=self.host.reset_work_credits)
+        self.reset_credits_button.pack(side="left", padx=self.px((8, 0)))
         ttk.Label(chance_card, textvariable=self.host.credit_detail_var, style="CardMuted.TLabel").pack(anchor="w", fill="x")
         self.credit_progress = ttk.Progressbar(chance_card, maximum=100)
         self.credit_progress.pack(fill="x", pady=self.px((12, 6)))
@@ -824,8 +865,14 @@ class ActivityTrackerApp:
 
     def _save_session(self):
         try:
+            now = utc_now()
+            data = self.timeline.to_dict(now, self.host.game.work.reset_at)
+            work = asdict(self.host.game.work)
+            # 备份的工作账户与同一时刻的明细一致，重设后不会恢复重设前的工作时间。
+            work["work_seconds"] += self.timeline.work_seconds(now, self.host.game.work.reset_at) - self.host.work_accounted_seconds
+            data["work"] = work
             temporary = self.autosave_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.timeline.to_dict(utc_now()), ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(self.autosave_path)
         except OSError as error:
             self.host.status.set(f"工作记录备份失败：{error}")
@@ -1326,7 +1373,7 @@ class ActivityTrackerApp:
         seconds = self.timeline.work_seconds(now)
         self.work_time_var.set(f"记录中的工作时长：{self.format_work_time(seconds)}")
         self._refresh_records(now)
-        self.host._work_changed(seconds)
+        self.host._work_changed(self.timeline.work_seconds(now, self.host.game.work.reset_at))
 
     def work_seconds_this_session(self, now=None):
         return self.timeline.work_seconds(now or utc_now())
@@ -1534,9 +1581,19 @@ class Game:
             game.work.validate()
             game.activity_timeline = data.get("activity_timeline")
             if game.activity_timeline is not None:
-                ActivityTimeline.from_dict(game.activity_timeline)
-                if game.activity_timeline["accounted_seconds"] > game.work.work_seconds:
-                    raise ValueError("活动记录的工作时长超过累计工作时长。")
+                timeline = ActivityTimeline.from_dict(game.activity_timeline, TaskCatalog(game.task_options))
+                checkpoint = parse_utc(game.activity_timeline["checkpoint_utc"])
+                if game.work.reset_at is not None and parse_utc(game.work.reset_at) > checkpoint:
+                    raise ValueError("统计重设时间不能晚于保存时间。")
+                saved_reset = game.activity_timeline.get("credit_reset_at")
+                if saved_reset is not None and (game.work.reset_at is None
+                        or parse_utc(saved_reset) != parse_utc(game.work.reset_at)):
+                    raise ValueError("工作账户与活动记录的重设时间不一致。")
+                credited = game.activity_timeline.get("credit_accounted_seconds",
+                    timeline.work_seconds(checkpoint, game.work.reset_at) if game.work.reset_at
+                    else game.activity_timeline["accounted_seconds"])
+                if credited > game.work.work_seconds:
+                    raise ValueError("活动记录的兑换工作时长超过累计工作时长。")
             # 原六个奖项必须完整；旧文件缺少的新增奖项使用默认配置。
             for category in CATEGORIES[:6]:
                 game.prizes[category] = Prize(**data["prizes"][category])
@@ -2082,6 +2139,8 @@ class BobingApp:
                     "默认每工作 25 分钟得到一次机会，可在工作计时页修改 X。未满 X 的零散时间与未用次数跨会话保存。"
                     "每次有效掷骰扣一次机会，包括未中奖或库存不足。无效输入不扣次数，兼得多个奖项仍只扣一次。"
                     "顶部可手动增加次数；重新开始博饼不清空工作时长和剩余机会。\n"
+                    "工作兑换区域的「重设」按钮会清零兑换工作时长、手动增加、累计使用次数及次数欠额，保留兑换分钟设置。"
+                    "活动记录、奖品和当前计时不受影响；从重设时刻重新累计工作，旧活动不会重新计入机会。\n"
                     "修改 X 会按累计工作时间重新计算应得次数。离席修正会相应增加或扣回工作机会；"
                     "如已经用掉被扣回的机会，会显示欠额，之后工作或手动添加先补回。已有奖品不追扣。\n"
                     "活动事件显示中文与英文对应，支持编辑活动及起止时间、拆分为两段和恢复为未分配时间。"
@@ -2351,6 +2410,29 @@ class BobingApp:
         self.status.set(f"已手动增加 {count} 次博饼机会。")
         self._save()
 
+    def reset_work_credits(self) -> None:
+        if not messagebox.askyesno("重设工作兑换统计",
+                "将累计兑换工作时长、手动增加次数、累计使用次数和次数欠额清零。\n"
+                "保留兑换分钟设置、活动记录、奖品和当前计时。\n"
+                "从重设时刻开始重新累计工作，确定重设？", parent=self.root):
+            return
+        old_work = WorkCredits(**asdict(self.game.work))
+        old_accounted = self.work_accounted_seconds
+        old_timeline = self.game.activity_timeline
+        self.game.work.reset(utc_now())
+        self.work_accounted_seconds = 0
+        self.tracker.refresh_time_displays()
+        if not self._save():
+            self.game.work = old_work
+            self.work_accounted_seconds = old_accounted
+            self.game.activity_timeline = old_timeline
+            self.tracker.refresh_time_displays()
+            self.status.set("重设未保存，原工作兑换统计已保留。")
+            return
+        self.tracker._save_session()
+        self.credit_last_save = time.monotonic()
+        self.status.set("工作兑换统计已重设；之后的工作时间从现在重新累计。")
+
     def save_work_config(self) -> None:
         self.tracker.refresh_time_displays()
         try:
@@ -2524,10 +2606,10 @@ class BobingApp:
         try:
             if self.tracker:
                 now = utc_now()
-                seconds = self.tracker.timeline.work_seconds(now)
+                seconds = self.tracker.timeline.work_seconds(now, self.game.work.reset_at)
                 self.game.work.add_work(seconds - self.work_accounted_seconds)
                 self.work_accounted_seconds = seconds
-                self.game.activity_timeline = self.tracker.timeline.to_dict(now)
+                self.game.activity_timeline = self.tracker.timeline.to_dict(now, self.game.work.reset_at)
                 self.game.task_options = self.catalog.to_list()
                 self._refresh_chances()
             self.store.save(self.game)
@@ -2562,7 +2644,7 @@ class BobingApp:
             return False
         if self.tracker:
             tracker = self.tracker
-            full = tracker.timeline.to_dict(exit_time)
+            full = tracker.timeline.to_dict(exit_time, self.game.work.reset_at)
             original_accounted = self.work_accounted_seconds
             try:
                 tracker.export_to_ics(events=tracker.events[:-1], exit_time=exit_time)
@@ -2575,7 +2657,7 @@ class BobingApp:
             tracker.timeline.events = last
             tracker.timeline.started_utc = last[0]["start_utc"] if last else exit_time.isoformat()
             # 已导出事件的工作时长留在累计账户中；不能因删掉明细而扣回博饼机会。
-            self.work_accounted_seconds = tracker.timeline.work_seconds(exit_time)
+            self.work_accounted_seconds = tracker.timeline.work_seconds(exit_time, self.game.work.reset_at)
             if not self._save() or not tracker._save_session():
                 tracker.timeline = ActivityTimeline.from_dict(full, self.catalog)
                 self.work_accounted_seconds = original_accounted
