@@ -241,7 +241,7 @@ def classify_dice(dice: list[int], rules: Rules | None = None) -> RollResult:
 
 
 def champion_score(dice: list[int]) -> tuple[int, int, int] | None:
-    """按原规则参考比较状元；同级点数完全相同才算等大。"""
+    """按指定状元等级排序；同级沿用原点数比较方式。"""
     result = classify_dice(dice)
     if not any(category == "状元" for category, _count in result.awards):
         return None
@@ -260,20 +260,43 @@ def champion_score(dice: list[int]) -> tuple[int, int, int] | None:
     return (0, sum(value for value in dice if value != 4), 0)
 
 
-def champion_detail(dice: list[int]) -> str:
+def champion_name(dice: list[int]) -> str:
     score = champion_score(dice)
     if score is None:
         return ""
     level, primary, secondary = score
+    numerals = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
     if level == 0:
-        return f"余下两骰合计 {primary} 点"
+        return "状元带" + numerals[primary]
     if level == 1:
-        return f"五个 {primary} 点，余点 {secondary}"
+        return "五子带" + numerals[secondary]
     if level == 2:
-        return f"余下单骰 {primary} 点"
-    if level == 3:
-        return f"六个 {primary} 点"
-    return {4: "六个一点", 5: "六个四点", 6: "四个四点、两个一点"}[level]
+        return "五红带" + numerals[primary]
+    return {3: "六勃黑", 4: "遍地锦", 5: "六勃红", 6: "状元插金花"}[level]
+
+
+def new_record_time() -> str:
+    """保存发生时的日期、秒与 UTC 偏移，不依赖之后查看时的时区。"""
+    return utc_now().astimezone().isoformat(sep=" ", timespec="seconds")
+
+
+def record_time_text(value: str) -> str:
+    """仅显示已知信息，不为旧记录推测日期或时区。"""
+    text = value.strip() or "未知时间"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return f"日期未知 {text}（时区未知）"
+    if len(text) == 10:
+        return f"{stamp:%Y-%m-%d}（时间、时区未知）"
+    clock = stamp.strftime("%Y-%m-%d %H:%M:%S")
+    offset = stamp.strftime("%z")
+    if not offset:
+        return clock + "（时区未知）"
+    zone = offset[:3] + ":" + offset[3:5]
+    if len(offset) > 5:
+        zone += ":" + offset[5:]
+    return clock + " UTC" + zone
 
 
 @dataclass
@@ -1719,13 +1742,13 @@ class Game:
     champion_records: list[dict] = field(default_factory=list)
     champion_sequence: int = 0
 
-    def _record_champion(self, dice: list[int], title: str, time_text: str | None = None) -> None:
+    def _record_champion(self, dice: list[int], time_text: str | None = None) -> None:
         if champion_score(dice) is None:
             return
         self.champion_sequence += 1
         self.champion_records.append({"sequence": self.champion_sequence,
-            "time": (time_text.strip() or "未知时间") if time_text is not None else utc_now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-            "dice": list(dice), "title": title if title.strip() else classify_dice(dice).title})
+            "time": (time_text.strip() or "未知时间") if time_text is not None else new_record_time(),
+            "dice": list(dice), "title": champion_name(dice)})
         # 排序与裁切都只操作独立榜单，不删除或改动普通博饼记录。
         self.champion_records.sort(key=lambda row: (champion_score(row["dice"]), row["sequence"]), reverse=True)
         self.champion_records = self.champion_records[:50]
@@ -1771,12 +1794,12 @@ class Game:
             if count < requested:
                 depleted.append(category + ("库存不足" if count else "已领完"))
         self.roll_count += 1
-        row = {"number": self.roll_count, "time": datetime.now().strftime("%H:%M:%S"),
+        row = {"number": self.roll_count, "time": new_record_time(),
                "dice": list(dice), "title": result.title, "explanation": result.explanation,
                "granted": granted, "depleted": depleted, "pending": [choice["category"] for choice in choices]}
         self.pending_choices = choices
         self.history.append(row)
-        self._record_champion(dice, result.title)
+        self._record_champion(dice, row["time"])
         # 保留最近 3000 条记录；余额及当前局掷骰总次数不受此限制影响。
         self.history = self.history[-3000:]
         return row
@@ -2048,7 +2071,7 @@ class Game:
             if "champion_records" not in data:
                 # 首次打开旧存档时，仅补入当前仍保留的状元记录；原博饼记录保持原样。
                 for row in game.history:
-                    game._record_champion(row["dice"], row["title"], row["time"])
+                    game._record_champion(row["dice"], row["time"])
             else:
                 records = data["champion_records"]
                 if not isinstance(records, list) or len(records) > 50:
@@ -2068,6 +2091,8 @@ class Game:
                 if type(game.champion_sequence) is not int or game.champion_sequence < max(sequences, default=0):
                     raise ValueError("状元记录的先后次序无效。")
                 game.champion_records = copy.deepcopy(records)
+                for record in game.champion_records:
+                    record["title"] = champion_name(record["dice"])
                 game.champion_records.sort(key=lambda row: (champion_score(row["dice"]), row["sequence"]), reverse=True)
             game.session = data.get("session")
             if game.session is not None:
@@ -2561,8 +2586,8 @@ class BobingApp:
         self.champion_count_var = tk.StringVar()
         ttk.Label(self.champion_section, textvariable=self.champion_count_var, style="CardMuted.TLabel").pack(
             anchor="w", pady=self.px((4, 8)))
-        self.champion_tree = self._tree(self.champion_section, ("rank", "time", "dice", "result", "detail"),
-            ("名次", "时间", "六颗骰子", "状元类别", "比较点数"), (55, 180, 160, 200, 300), height=8)
+        self.champion_tree = self._tree(self.champion_section, ("rank", "time", "dice", "result"),
+            ("名次", "时间（含时区）", "六颗骰子", "状元大小"), (55, 320, 170, 280), height=8)
 
         def scroll_champions(event):
             if event.delta:
@@ -2576,7 +2601,7 @@ class BobingApp:
         ttk.Label(self.history_section, text="本局博饼记录（最多保留最近 3000 次）", style="Section.TLabel").pack(
             anchor="w", pady=self.px((0, 10)))
         self.history_tree = self._tree(self.history_section, ("number", "time", "dice", "result", "reward"),
-            ("次数", "时间", "六颗骰子", "奖品类别", "领取结果"), (55, 80, 135, 180, 550), height=6)
+            ("次数", "时间（含时区）", "六颗骰子", "奖品类别", "领取结果"), (55, 310, 140, 180, 420), height=6)
 
     def _build_rules(self) -> None:
         text = tk.Text(self.rules_tab, wrap="word", bg=self.CARD, fg=self.INK, relief="flat",
@@ -2609,10 +2634,11 @@ class BobingApp:
                     "各种状元组合共用「状元」库存；每次六同领取一份状元和一份插金花。不同地方的传统玩法可能不同。\n\n"
                     "状元记录\n"
                     "博饼记录页顶部是独立的状元记录，最多保留排名最高的 50 条，列表约显示 8 条，可用滚轮或滚动条查看其他记录。"
-                    "从大到小为：插金花、六勃红、遍地锦、六勃黑、五红、五子、四红。六勃黑比同点数字；五红比余下单骰；五子先比五颗同点数字，再比余下单骰；四红比余下两骰之和。"
+                    "从大到小为：状元插金花、六勃红、遍地锦、六勃黑、五红、五子、普通状元。六勃黑比同点数字；五红比余下单骰；五子先比五颗同点数字，再比余下单骰；普通状元比余下两骰之和。"
+                    "「状元大小」列中，四红写作「状元带十二」等（带的是余下两骰之和），五子写作「五子带二」等（带的是余下单骰），五红写作「五红带六」等。六同分别写作六勃红、遍地锦或六勃黑；四个四点加两个一点写作状元插金花。"
                     "同样大的记录按新到旧排列，满 50 条时淘汰最小且最旧的记录；更小的新记录不入榜。"
                     "重新开始博饼不会清空状元记录。库存不足时博到状元也会记录；下方本局记录仍照常记录状元，不受榜单影响。"
-                    "首次打开旧存档时，会从仍保留的本局记录中补入状元；旧记录沿用原来的时间。\n\n"
+                    "新状元记录和博饼记录均保存年月日、时分秒及发生时的时区，列表以 UTC 偏移显示时区。首次打开旧存档时，会从仍保留的本局记录中补入状元；旧记录未保存的日期或时区显示为未知，不推测补填。\n\n"
                     "配置与使用\n"
                     "每个奖项最多设置三个奖品，每个内容右侧有独立的分钟 / 物品份数。可以在同一奖项中同时设置时间奖励和物品奖励。库存仍按奖项共用。至少填写一栏，也可以只填第二栏或第三栏。"
                     "只有一个非空内容时立即发奖，有两三个不同内容时在掷骰结果区域选择一项并确认领奖；选完全部奖项后才能再次掷骰或重新开始博饼。"
@@ -2818,7 +2844,7 @@ class BobingApp:
     def _refresh_history(self) -> None:
         self.history_tree.delete(*self.history_tree.get_children())
         for row in reversed(self.game.history):
-            self.history_tree.insert("", "end", values=(row["number"], row["time"], " ".join(map(str, row["dice"])),
+            self.history_tree.insert("", "end", values=(row["number"], record_time_text(row["time"]), " ".join(map(str, row["dice"])),
                                                         row["title"], reward_text(row)))
         self._refresh_champions()
 
@@ -2827,8 +2853,8 @@ class BobingApp:
         position = self.champion_tree.yview()[0]
         self.champion_tree.delete(*self.champion_tree.get_children())
         for rank, record in enumerate(self.game.champion_records, 1):
-            self.champion_tree.insert("", "end", iid=str(record["sequence"]), values=(rank, record["time"],
-                " ".join(map(str, record["dice"])), record["title"], champion_detail(record["dice"])))
+            self.champion_tree.insert("", "end", iid=str(record["sequence"]), values=(rank, record_time_text(record["time"]),
+                " ".join(map(str, record["dice"])), champion_name(record["dice"])))
         for identifier in selected:
             if self.champion_tree.exists(identifier):
                 self.champion_tree.selection_set(identifier)
@@ -2942,7 +2968,7 @@ class BobingApp:
         self._refresh_items()
         if row["granted"] and not self.game.session:
             self.reward_tabs.select(self.item_rewards_tab)
-        self.history_tree.insert("", 0, values=(row["number"], row["time"], " ".join(map(str, dice)),
+        self.history_tree.insert("", 0, values=(row["number"], record_time_text(row["time"]), " ".join(map(str, dice)),
                                                row["title"], reward_text(row)))
         rows = self.history_tree.get_children()
         if len(rows) > 3000:
