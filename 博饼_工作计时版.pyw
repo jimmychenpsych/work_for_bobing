@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 import json
 import math
 from pathlib import Path
@@ -21,7 +23,7 @@ import sys
 import time
 import uuid
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 
 CATEGORIES = ("状元", "对堂", "三红", "四进", "二举", "一秀", "插金花", "安慰奖")
@@ -82,19 +84,91 @@ def display_scale(root: tk.Tk) -> float:
     return max(0.75, dpi / 96.0)
 
 
+def quantity_tenths(value) -> int:
+    """使用十分之一份整数运算，避免 0.1 + 0.2 的浮点误差。"""
+    if type(value) not in (int, float, Decimal):
+        raise ValueError("数量必须是非负数，最多保留一位小数。")
+    number = Decimal(str(value))
+    if not number.is_finite() or number < 0:
+        raise ValueError("数量必须是非负数，最多保留一位小数。")
+    scaled = number * 10
+    if scaled != scaled.to_integral_value():
+        raise ValueError("数量最多保留一位小数。")
+    return int(scaled)
+
+
+def number_from_tenths(units: int) -> int | float:
+    return units // 10 if units % 10 == 0 else float(Decimal(units) / 10)
+
+
+def parse_decimal_number(text: str) -> int | float:
+    try:
+        return number_from_tenths(quantity_tenths(Decimal(text.strip())))
+    except (InvalidOperation, ValueError):
+        raise ValueError("请输入非负数，最多保留一位小数。") from None
+
+
+def format_quantity(value) -> str:
+    units = quantity_tenths(value)
+    return str(units // 10) if units % 10 == 0 else f"{units // 10}.{units % 10}"
+
+
+def item_quantity_text(value) -> str:
+    return format_quantity(value) + ("件" if quantity_tenths(value) % 10 == 0 else "份")
+
+
 @dataclass
 class Prize:
     activity: str
-    minutes: int
+    minutes: int | float
     stock: int
+    alternatives: tuple[str, str] = ("", "")
+    alternative_minutes: tuple[int | float | None, int | float | None] = (None, None)
+
+    def __post_init__(self):
+        if isinstance(self.alternatives, list):
+            self.alternatives = tuple(self.alternatives)
+        if isinstance(self.alternative_minutes, list):
+            self.alternative_minutes = tuple(self.alternative_minutes)
+
+    @property
+    def amounts(self) -> tuple:
+        # 旧存档只有一组数量；缺少的新字段沿用原数量，首次保存后分别记录。
+        return (self.minutes, *(self.minutes if value is None else value for value in self.alternative_minutes))
+
+    @property
+    def option_details(self) -> tuple:
+        return tuple(dict.fromkeys((name.strip(), amount)
+            for name, amount in zip((self.activity, *self.alternatives), self.amounts) if name.strip()))
+
+    @property
+    def choices(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(value.strip() for value in (self.activity, *self.alternatives) if value.strip()))
+
+    @property
+    def is_item(self) -> bool:
+        return self.minutes < 1
+
+    @property
+    def item_amount(self) -> int | float:
+        return 1 if self.minutes == 0 else self.minutes
 
     def validate(self) -> None:
-        if not isinstance(self.activity, str) or not self.activity.strip():
-            raise ValueError("奖品内容不能为空。")
-        if len(self.activity.strip()) > 80:
-            raise ValueError("奖品内容最多输入 80 个字符。")
-        if type(self.minutes) is not int or not 0 <= self.minutes <= 100000:
-            raise ValueError("每次奖励分钟必须是 0～100000 的整数；0 表示物品奖励。")
+        if not isinstance(self.alternatives, (tuple, list)) or len(self.alternatives) != 2:
+            raise ValueError("每个奖项最多填写三个奖品内容。")
+        if not isinstance(self.alternative_minutes, (tuple, list)) or len(self.alternative_minutes) != 2:
+            raise ValueError("每个奖品须有独立的分钟或物品份数。")
+        for value in (self.activity, *self.alternatives):
+            if not isinstance(value, str) or len(value.strip()) > 80:
+                raise ValueError("每栏奖品内容最多输入 80 个字符。")
+        if not self.choices:
+            raise ValueError("三个奖品内容至少填写一栏。")
+        for amount in self.amounts:
+            if type(amount) not in (int, float):
+                raise ValueError("分钟须为 0、小于 1 的一位小数，或 1～100000 的整数。")
+            units = quantity_tenths(amount)
+            if units > 1000000 or (units >= 10 and units % 10):
+                raise ValueError("0 表示一件物品；0.1～0.9 表示物品份数；1 以上须为整数分钟。")
         if type(self.stock) is not int or not 0 <= self.stock <= 100000:
             raise ValueError("初始份数必须是 0～100000 的整数。")
 
@@ -166,6 +240,42 @@ def classify_dice(dice: list[int], rules: Rules | None = None) -> RollResult:
     return RollResult("未中奖", "没有四点，也没有符合奖项的同点组合。")
 
 
+def champion_score(dice: list[int]) -> tuple[int, int, int] | None:
+    """按原规则参考比较状元；同级点数完全相同才算等大。"""
+    result = classify_dice(dice)
+    if not any(category == "状元" for category, _count in result.awards):
+        return None
+    counts = Counter(dice)
+    red = counts[4]
+    if red == 4 and counts[1] == 2:
+        return (6, 0, 0)  # 插金花
+    if max(counts.values()) == 6:
+        value = dice[0]
+        return (5, 0, 0) if value == 4 else ((4, 0, 0) if value == 1 else (3, value, 0))
+    if red == 5:
+        return (2, next(value for value in dice if value != 4), 0)
+    if max(counts.values()) == 5:
+        repeated = next(value for value, count in counts.items() if count == 5)
+        return (1, repeated, next(value for value in dice if value != repeated))
+    return (0, sum(value for value in dice if value != 4), 0)
+
+
+def champion_detail(dice: list[int]) -> str:
+    score = champion_score(dice)
+    if score is None:
+        return ""
+    level, primary, secondary = score
+    if level == 0:
+        return f"余下两骰合计 {primary} 点"
+    if level == 1:
+        return f"五个 {primary} 点，余点 {secondary}"
+    if level == 2:
+        return f"余下单骰 {primary} 点"
+    if level == 3:
+        return f"六个 {primary} 点"
+    return {4: "六个一点", 5: "六个四点", 6: "四个四点、两个一点"}[level]
+
+
 @dataclass
 class Balance:
     earned_ms: int = 0
@@ -179,28 +289,36 @@ class Balance:
 
 @dataclass
 class ItemBalance:
-    earned: int = 0
-    claimed: int = 0
+    earned: int | float = 0
+    claimed: int | float = 0
 
     @property
-    def available(self) -> int:
-        return self.earned - self.claimed
+    def available(self) -> int | float:
+        return number_from_tenths(quantity_tenths(self.earned) - quantity_tenths(self.claimed))
+
+    def add(self, amount) -> None:
+        self.earned = number_from_tenths(quantity_tenths(self.earned) + quantity_tenths(amount))
+
+    def claim(self, amount) -> None:
+        self.claimed = number_from_tenths(quantity_tenths(self.claimed) + quantity_tenths(amount))
 
 
 @dataclass
 class WorkCredits:
-    """跨会话累计工作秒数，机会按工作时长、手动添加量与已用量计算。"""
+    """跨会话保存工作、手动添加、悬赏奖励与已用机会。"""
 
     minutes_per_roll: int = 25
     work_seconds: int = 0
     manual_added: int = 0
     spent: int = 0
     reset_at: str | None = None
+    bounty_earned: int = 0
+    prize_earned: int = 0
 
     def validate(self) -> None:
         if type(self.minutes_per_roll) is not int or not 1 <= self.minutes_per_roll <= 100000:
             raise ValueError("每次博饼所需工作分钟必须是 1～100000 的整数。")
-        for value in (self.work_seconds, self.manual_added, self.spent):
+        for value in (self.work_seconds, self.manual_added, self.spent, self.bounty_earned, self.prize_earned):
             if type(value) is not int or value < 0:
                 raise ValueError("工作时长或博饼次数存档无效。")
         if self.reset_at is not None:
@@ -211,7 +329,8 @@ class WorkCredits:
     def reset(self, at) -> None:
         timestamp = at.isoformat()
         parse_utc(timestamp)
-        self.work_seconds = self.manual_added = self.spent = 0
+        self.work_seconds = self.manual_added = self.spent = self.bounty_earned = 0
+        self.prize_earned = 0
         self.reset_at = timestamp
 
     @property
@@ -220,7 +339,7 @@ class WorkCredits:
 
     @property
     def available(self) -> int:
-        return self.earned + self.manual_added - self.spent
+        return self.earned + self.manual_added + self.bounty_earned + self.prize_earned - self.spent
 
     @property
     def seconds_to_next(self) -> int:
@@ -238,8 +357,26 @@ class WorkCredits:
 
     def consume_roll(self) -> None:
         if self.available <= 0:
-            raise ValueError("暂无可用博饼次数，请先工作或手动增加次数。")
+            raise ValueError("暂无可用博饼次数，请先工作、完成悬赏或手动增加次数。")
         self.spent += 1
+
+
+@dataclass
+class WorkBounty:
+    id: str
+    task: str
+    rolls: int
+
+    def validate(self, *, allow_legacy=False) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("悬赏任务标识无效。")
+        if not isinstance(self.task, str) or not self.task.strip() or len(self.task) > 200:
+            raise ValueError("悬赏任务内容须为 1～200 个字符。")
+        if not allow_legacy and any(char in self.task for char in "\r\n\t"):
+            raise ValueError("悬赏任务内容只能占一行。")
+        maximum = 100000 if allow_legacy else 99
+        if type(self.rolls) is not int or not 1 <= self.rolls <= maximum:
+            raise ValueError(f"悬赏次数必须是 1～{maximum} 的整数。")
 
 
 APP_NAME = "ActivityTracker"
@@ -639,6 +776,7 @@ class ActivityTrackerApp:
         self.row_data = {}
         self.editor = None
         self.paragraphs = []
+        # 事件编辑、拆分和合并共用的任务名称映射。
         self.left_activity_choices = {self.catalog.label(activity["name"]): activity["name"] for activity in self.catalog.visible}
         self.timeline = ActivityTimeline(utc_now(), self.catalog)
         saved = host.game.activity_timeline
@@ -655,8 +793,8 @@ class ActivityTrackerApp:
         self.selected_var = tk.StringVar(value="未选择活动")
         self.activity_time_var = tk.StringVar(value="暂无活动记录")
         self.work_time_var = tk.StringVar()
-        self.left_minutes_var = tk.StringVar()
-        self.left_activity_var = tk.StringVar(value=self.catalog.label(self.catalog.visible[0]["name"]) if self.catalog.visible else "")
+        self.bounty_task_var = tk.StringVar()
+        self.bounty_rolls_var = tk.StringVar(value="1")
         self._build(parent)
         self._rebuild_task_buttons()
         self.update_work_timer()
@@ -700,7 +838,7 @@ class ActivityTrackerApp:
                 checkpoint = max(checkpoint, max(parse_utc(item["end_utc"]) for item in events))
             credits = self.host.game.work
             if (data.get("work") is not None and credits.reset_at is None
-                    and credits.work_seconds == credits.manual_added == credits.spent == 0):
+                    and credits.work_seconds == credits.manual_added == credits.spent == credits.bounty_earned == credits.prize_earned == 0):
                 credits = WorkCredits(**data["work"])
                 credits.validate()
                 self.host.game.work = credits
@@ -757,8 +895,12 @@ class ActivityTrackerApp:
                                          font=("Microsoft YaHei UI", 12, "bold"), style="Card.TLabel")
         self.work_time_label.pack(fill="x", pady=self.px((16, 4)))
 
+        bounty_card = self.host._card(content)
+        bounty_card.grid(row=0, column=1, sticky="nsew")
+        self._build_bounties(bounty_card)
+
         chance_card = self.host._card(content)
-        chance_card.grid(row=0, column=1, sticky="nsew")
+        chance_card.grid(row=2, column=0, columnspan=2, sticky="ew", pady=self.px((12, 0)))
         ttk.Label(chance_card, text="工作兑换博饼机会", style="Section.TLabel").pack(anchor="w")
         self.quota_var = tk.StringVar(value=str(self.host.game.work.minutes_per_roll))
         quota_row = ttk.Frame(chance_card, style="Card.TFrame")
@@ -779,7 +921,7 @@ class ActivityTrackerApp:
                   wraplength=self.px(440)).pack(anchor="w", fill="x")
         for paragraph in (
             "工作活动计入博饼机会，休息活动不计入。零散工作时间和未用次数会保留。",
-            "修改兑换分钟数或调整事件后，会按工作时长重算次数。已用掉的次数如需扣回，会显示待补回次数，之后可用工作或手动添加补回。",
+            "修改兑换分钟数或调整事件后，会按工作时长重算次数。已用掉的次数如需扣回，会显示待补回次数，之后可用工作、悬赏或手动添加补回。",
             "每次掷骰扣除一次机会，未中奖也会扣除。重新开始博饼会保留工作时长与剩余机会。",
         ):
             widget = WrappingParagraph(chance_card, paragraph, self.host)
@@ -812,23 +954,8 @@ class ActivityTrackerApp:
         self.merge_button.pack(side="left", padx=self.px(8))
         ttk.Button(tools, text="新增事件", command=self.new_event).pack(side="right")
 
-        correction = self.host._card(content)
-        correction.grid(row=2, column=0, columnspan=2, sticky="ew", pady=self.px((12, 0)))
-        ttk.Label(correction, text="快速修正所选事件的最后几分钟", style="Section.TLabel").pack(anchor="w")
-        left_frame = ttk.Frame(correction, style="Card.TFrame")
-        left_frame.pack(fill="x", pady=self.px((10, 6)))
-        left_frame.columnconfigure(3, weight=1)
-        self.left_button = ttk.Button(left_frame, text="修正", command=self.record_time_away)
-        self.left_button.grid(row=0, column=0, padx=self.px((0, 8)))
-        self.left_minutes_entry = ttk.Entry(left_frame, textvariable=self.left_minutes_var, width=7, validate="key",
-            validatecommand=(self.root.register(self.valid_minutes_input), "%P"))
-        self.left_minutes_entry.grid(row=0, column=1)
-        ttk.Label(left_frame, text="分钟，实际活动为", style="Card.TLabel").grid(row=0, column=2, padx=self.px(8))
-        self.left_activity_dropdown = ttk.Combobox(left_frame, textvariable=self.left_activity_var,
-            state="readonly", values=list(self.left_activity_choices), width=20)
-        self.left_activity_dropdown.grid(row=0, column=3, sticky="ew")
-        ttk.Label(correction, text="可反复修正已结束的事件；未选择事件时修正当前计时。编辑当前计时前会先结束该段。",
-                  style="CardMuted.TLabel", wraplength=self.px(1030)).pack(anchor="w", fill="x")
+        self.activity_card, self.bounty_card = activity_card, bounty_card
+        self.records_card, self.chance_card = records, chance_card
 
         def layout(event):
             canvas.itemconfigure(window, width=event.width)
@@ -836,32 +963,211 @@ class ActivityTrackerApp:
                 content.columnconfigure(0, weight=1)
                 content.columnconfigure(1, weight=0)
                 activity_card.grid_configure(row=0, column=0, columnspan=2, padx=0)
-                chance_card.grid_configure(row=1, column=0, columnspan=2, pady=self.px((12, 0)))
+                bounty_card.grid_configure(row=1, column=0, columnspan=2, pady=self.px((12, 0)))
                 records.grid_configure(row=2)
-                correction.grid_configure(row=3)
+                chance_card.grid_configure(row=3)
             else:
                 content.columnconfigure(0, weight=3)
                 content.columnconfigure(1, weight=2)
                 activity_card.grid_configure(row=0, column=0, columnspan=1, padx=self.px((0, 12)))
-                chance_card.grid_configure(row=0, column=1, columnspan=1, pady=0)
+                bounty_card.grid_configure(row=0, column=1, columnspan=1, pady=0)
                 records.grid_configure(row=1)
-                correction.grid_configure(row=2)
+                chance_card.grid_configure(row=2)
 
         canvas.bind("<Configure>", layout)
 
-        def scroll(event):
-            if str(self.host.tabs.select()) == str(parent):
-                canvas.yview_scroll(-int(event.delta / 120), "units")
-                return "break"
-
         def bind_wheel(widget):
             if isinstance(widget, WrappingParagraph) or not isinstance(widget, (ttk.Treeview, ttk.Combobox, ttk.Spinbox, tk.Text)):
-                widget.bind("<MouseWheel>", scroll, add="+")
+                widget.bind("<MouseWheel>", self._scroll_work_page, add="+")
             for child in widget.winfo_children():
                 bind_wheel(child)
 
         bind_wheel(content)
         self.scroll_canvas = canvas
+
+    def _scroll_work_page(self, event):
+        if str(self.host.tabs.select()) == str(self.host.work_tab):
+            self.scroll_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+    def _build_bounties(self, card):
+        ttk.Label(card, text="工作悬赏", style="Section.TLabel").pack(anchor="w")
+        hint = WrappingParagraph(card, "点击「完成」领取悬赏；点击「删除」取消任务。任务文字可选中后按 Ctrl+C 复制。", self.host)
+        hint.pack(fill="x", pady=self.px((6, 10)))
+        self.paragraphs.append(hint)
+        self.bounty_font = tkfont.Font(root=self.root,
+            font=ttk.Style(self.root).lookup("TEntry", "font") or ("Microsoft YaHei UI", 10))
+        self.bounty_text_width = self.px(180)
+        self.bounty_limit_var = tk.StringVar()
+        style = ttk.Style(self.root)
+        style.configure("BountyAction.TButton", padding=self.px((5, 2)))
+        # 最多放置 7 条悬赏，按实际行高预留空间，不使用内部滚动条。
+        sample_button = ttk.Button(card, text="完成", width=4, style="BountyAction.TButton")
+        sample_reward = ttk.Label(card, text="99 次", width=5, style="Card.TLabel")
+        self.bounty_row_gap = self.px(5)
+        self.bounty_row_height = max(sample_button.winfo_reqheight(), self.bounty_font.metrics("linespace") + 2)
+        self.bounty_max_rows = 7
+        self.bounty_actions_width = (sample_button.winfo_reqwidth() * 2
+            + sample_reward.winfo_reqwidth() + self.px(18))
+        sample_button.destroy()
+        sample_reward.destroy()
+
+        task_row = ttk.Frame(card, style="Card.TFrame")
+        task_row.pack(fill="x")
+        task_row.columnconfigure(1, weight=1)
+        ttk.Label(task_row, text="任务", style="Card.TLabel").grid(row=0, column=0, padx=self.px((0, 8)))
+        self.bounty_task_entry = ttk.Entry(task_row, textvariable=self.bounty_task_var, width=18,
+            validate="key", validatecommand=(self.root.register(self._valid_bounty_task_input), "%P", "%V"))
+        self.bounty_task_entry.grid(row=0, column=1, sticky="ew")
+        self.bounty_task_entry.bind("<Return>", lambda _event: self.add_bounty())
+        reward_row = ttk.Frame(card, style="Card.TFrame")
+        reward_row.pack(fill="x", pady=self.px((8, 6)))
+        ttk.Label(reward_row, text="悬赏", style="Card.TLabel").pack(side="left")
+        self.bounty_rolls_spinbox = ttk.Spinbox(reward_row, from_=1, to=99,
+            width=3, textvariable=self.bounty_rolls_var)
+        self.bounty_rolls_spinbox.pack(side="left", padx=self.px(8))
+        self.bounty_rolls_spinbox.bind("<Return>", lambda _event: self.add_bounty())
+        ttk.Label(reward_row, text="次博饼", style="Card.TLabel").pack(side="left")
+        self.add_bounty_button = ttk.Button(reward_row, text="添加悬赏", style="Green.TButton", command=self.add_bounty)
+        self.add_bounty_button.pack(side="right")
+        self.bounty_limit_label = ttk.Label(card, textvariable=self.bounty_limit_var, style="CardMuted.TLabel")
+        self.bounty_limit_label.pack(fill="x", pady=self.px((0, 8)))
+
+        # 使用普通 Frame；每条固定为一行，无嵌套 Canvas、滚动条或滚动位置。
+        self.bounty_list_area = ttk.Frame(card, style="Card.TFrame",
+            height=self.bounty_max_rows * (self.bounty_row_height + self.bounty_row_gap))
+        self.bounty_list_area.pack(fill="both", expand=True)
+        self.bounty_list_area.pack_propagate(False)
+        self.bounty_rows = ttk.Frame(self.bounty_list_area, style="Card.TFrame")
+        self.bounty_rows.pack(fill="both", expand=True)
+        self.bounty_rows.bind("<Configure>", self._update_bounty_limits)
+        self._refresh_bounties()
+
+    def _update_bounty_limits(self, event=None):
+        width = event.width if event is not None else self.bounty_rows.winfo_width()
+        if width > self.bounty_actions_width:
+            self.bounty_text_width = width - self.bounty_actions_width
+        full_width_char = max(1, self.bounty_font.measure("汉"))
+        self.bounty_max_cjk_chars = max(1, self.bounty_text_width // full_width_char)
+        count = len(self.host.game.pending_bounties)
+        self.bounty_limit_var.set(f"{count}/{self.bounty_max_rows} 项 · 1～99 次 · 单行约 {self.bounty_max_cjk_chars} 个汉字（英文按宽度）")
+        self.add_bounty_button.configure(state="disabled" if count >= self.bounty_max_rows else "normal")
+        self.bounty_limit_label.configure(wraplength=max(self.px(180), width))
+
+    def _bounty_task_fits(self, value):
+        return (len(value) <= 200 and not any(char in value for char in "\r\n\t")
+                and self.bounty_font.measure(value) <= self.bounty_text_width)
+
+    def _valid_bounty_task_input(self, value, reason):
+        # 程序恢复或修改 StringVar 时保留原文；键入/粘贴及最终添加均按单行宽度校验。
+        if reason != "key" or self._bounty_task_fits(value):
+            return True
+        self.host.status.set("任务内容已达到一行的宽度上限，请缩短内容。")
+        return False
+
+    @staticmethod
+    def _select_bounty_text(event):
+        event.widget.selection_range(0, "end")
+        event.widget.icursor("end")
+        return "break"
+
+    def _refresh_bounties(self):
+        for child in self.bounty_rows.winfo_children():
+            child.destroy()
+        self.bounty_text_entries = {}
+        self.bounty_complete_buttons = {}
+        self.bounty_delete_buttons = {}
+        tasks = self.host.game.pending_bounties
+        # 旧存档若超过新上限，完整展示并禁止继续添加，不删改任何旧任务。
+        slots = max(self.bounty_max_rows, len(tasks))
+        self.bounty_list_area.configure(height=slots * (self.bounty_row_height + self.bounty_row_gap))
+        if not tasks:
+            empty = ttk.Label(self.bounty_rows, text="暂无待完成的悬赏任务", style="CardMuted.TLabel",
+                              padding=self.px((0, 12)))
+            empty.pack(anchor="w")
+            empty.bind("<MouseWheel>", self._scroll_work_page)
+        for bounty in tasks:
+            row = ttk.Frame(self.bounty_rows, style="Card.TFrame", height=self.bounty_row_height)
+            row.pack(fill="x", pady=(0, self.bounty_row_gap))
+            row.columnconfigure(0, weight=1)
+            text = tk.Entry(row, font=self.bounty_font, width=1, relief="flat", borderwidth=0,
+                highlightthickness=0, background=self.host.CARD, readonlybackground=self.host.CARD,
+                foreground=self.host.INK, exportselection=False, cursor="xterm")
+            text.insert(0, bounty.task)
+            text.configure(state="readonly")
+            text.grid(row=0, column=0, sticky="ew")
+            text.bind("<Control-a>", self._select_bounty_text)
+            text.bind("<Control-A>", self._select_bounty_text)
+            reward = ttk.Label(row, text=f"{bounty.rolls} 次", width=5, style="Card.TLabel", anchor="e")
+            reward.grid(row=0, column=1, padx=self.px((6, 4)))
+            complete = ttk.Button(row, text="完成", width=4, style="BountyAction.TButton",
+                command=lambda identifier=bounty.id: self.complete_bounty(identifier))
+            complete.grid(row=0, column=2, padx=self.px((0, 4)))
+            delete = ttk.Button(row, text="删除", width=4, style="BountyAction.TButton",
+                command=lambda identifier=bounty.id: self.delete_bounty(identifier))
+            delete.grid(row=0, column=3)
+            for widget in (row, text, reward, complete, delete):
+                widget.bind("<MouseWheel>", self._scroll_work_page)
+            self.bounty_text_entries[bounty.id] = text
+            self.bounty_complete_buttons[bounty.id] = complete
+            self.bounty_delete_buttons[bounty.id] = delete
+        self._update_bounty_limits()
+
+    def _change_bounty(self, change):
+        game = self.host.game
+        previous = list(game.pending_bounties)
+        previous_earned = game.work.bounty_earned
+        try:
+            bounty = change()
+        except ValueError as error:
+            messagebox.showwarning("悬赏未更改", str(error), parent=self.root)
+            self._refresh_bounties()
+            return None
+        if not self.host._save():
+            game.pending_bounties = previous
+            game.work.bounty_earned = previous_earned
+            self.host._refresh_chances()
+            self._refresh_bounties()
+            self.host.status.set("悬赏更改未保存，原任务和次数已保留，请修复保存问题后重试。")
+            return None
+        self._save_session()
+        self._refresh_bounties()
+        return bounty
+
+    def add_bounty(self):
+        if len(self.host.game.pending_bounties) >= self.bounty_max_rows:
+            messagebox.showwarning("悬赏已满", f"当前区域最多放置 {self.bounty_max_rows} 项悬赏，请先完成或删除已有任务。", parent=self.root)
+            return False
+        task = self.bounty_task_var.get().strip()
+        if not self._bounty_task_fits(task):
+            messagebox.showwarning("任务内容过长", "任务内容须能在悬赏列表的一行内完整显示，请缩短内容。", parent=self.root)
+            return False
+        raw = self.bounty_rolls_var.get().strip()
+        if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 99:
+            messagebox.showwarning("悬赏次数无效", "请输入 1～99 的整数次数。", parent=self.root)
+            return False
+        bounty = self._change_bounty(lambda:
+            self.host.game.add_bounty(self.bounty_task_var.get(), int(raw)))
+        if bounty is None:
+            return False
+        self.bounty_task_var.set("")
+        self.bounty_task_entry.focus_set()
+        self.host.status.set(f"已添加悬赏：{bounty.task}，完成后获得 {bounty.rolls} 次博饼机会。")
+        return True
+
+    def complete_bounty(self, identifier):
+        bounty = self._change_bounty(lambda: self.host.game.remove_bounty(identifier, completed=True))
+        if bounty is None:
+            return False
+        self.host.status.set(f"已完成：{bounty.task}，获得 {bounty.rolls} 次博饼机会。")
+        return True
+
+    def delete_bounty(self, identifier):
+        bounty = self._change_bounty(lambda: self.host.game.remove_bounty(identifier))
+        if bounty is None:
+            return False
+        self.host.status.set(f"已删除悬赏：{bounty.task}，未发放博饼次数。")
+        return True
 
     def _save_session(self):
         try:
@@ -905,10 +1211,6 @@ class ActivityTrackerApp:
         self.selected_var.set("未选择活动")
         self._changed(select=identifier)
 
-    @staticmethod
-    def valid_minutes_input(value):
-        return value == "" or (value.isascii() and value.isdigit())
-
     def selected_record(self):
         selection = self.event_tree.selection()
         return self.row_data.get(selection[0]) if len(selection) == 1 else None
@@ -921,7 +1223,6 @@ class ActivityTrackerApp:
                                    text="分配所选空档" if selected and not event else "编辑所选事件")
         self.split_button.configure(state="normal" if event else "disabled")
         self.unassign_button.configure(state="normal" if event else "disabled")
-        self.left_button.configure(state="normal" if event or self.current_option else "disabled")
         self.merge_button.configure(state="normal" if len(self.event_tree.selection()) >= 2 else "disabled")
 
     def _refresh_records(self, now):
@@ -955,49 +1256,6 @@ class ActivityTrackerApp:
             self._changed(select=identifier)
             row = self.selected_record()
         return row
-
-    def record_time_away(self):
-        if len(self.event_tree.selection()) > 1:
-            messagebox.showinfo("请选择一条记录", "快速修正时请选择一条活动记录。", parent=self.root)
-            return
-        value = self.left_minutes_var.get()
-        try:
-            minutes = int(value) if self.valid_minutes_input(value) and value else 0
-        except ValueError:
-            minutes = 0
-        if minutes <= 0:
-            messagebox.showerror("分钟数无效", "请输入大于零的整数分钟。", parent=self.root)
-            return
-        name = self.left_activity_choices.get(self.left_activity_var.get(), self.left_activity_var.get())
-        if name not in self.catalog.settings:
-            messagebox.showerror("请选择活动", "请选择实际进行的活动。", parent=self.root)
-            return
-        # 没有选中已记录事件时，仍支持原来的当前活动快速离席修正。
-        self.refresh_time_displays()
-        row = self.selected_record()
-        if row is None or row["kind"] == "gap":
-            row = self.row_data.get("current")
-        if row is None or row["kind"] == "gap":
-            messagebox.showerror("先选择事件", "请在记录列表中选择一个事件，或先开始工作计时。", parent=self.root)
-            return
-        start, end = parse_utc(row["start_utc"]), parse_utc(row["end_utc"])
-        if minutes * 60 > (end - start).total_seconds():
-            messagebox.showerror("时长超出范围", "修正分钟不能超过所选事件的时长。", parent=self.root)
-            return
-        if row["kind"] == "current":
-            identifier = self.timeline.finalize(utc_now())
-            row = self.timeline.get(identifier)
-            start, end = parse_utc(row["start_utc"]), parse_utc(row["end_utc"])
-            self.selected_var.set("未选择活动")
-        identifier = row["id"]
-        cutoff = end - timedelta(minutes=minutes)
-        if cutoff == start:
-            self.timeline.change(identifier, name, start, end, utc_now())
-        else:
-            self.timeline.split(identifier, cutoff, row["option_name"], name, utc_now())
-        self.left_minutes_var.set("")
-        self._changed(select=identifier)
-        self.host.status.set("离席时间已修正。可继续选择任意事件修改或拆分。")
 
     def apply_event_change(self, identifier, name, start, end):
         identifier = self.timeline.change(identifier, name, start, end, utc_now())
@@ -1170,9 +1428,6 @@ class ActivityTrackerApp:
                         padx=self.px(4), pady=self.px(4))
             self.activity_buttons[name] = button
         self.left_activity_choices = {task["label"]: task["name"] for task in self.catalog.visible}
-        self.left_activity_dropdown.configure(values=list(self.left_activity_choices))
-        if self.left_activity_var.get() not in self.left_activity_choices:
-            self.left_activity_var.set(next(iter(self.left_activity_choices)))
 
     def apply_task_options(self, tasks):
         tasks = [dict(task, enabled=True) for task in tasks]
@@ -1459,33 +1714,110 @@ class Game:
     work: WorkCredits = field(default_factory=WorkCredits)
     activity_timeline: dict | None = None
     task_options: list | None = None
+    pending_bounties: list[WorkBounty] = field(default_factory=list)
+    pending_choices: list[dict] = field(default_factory=list)
+    champion_records: list[dict] = field(default_factory=list)
+    champion_sequence: int = 0
+
+    def _record_champion(self, dice: list[int], title: str, time_text: str | None = None) -> None:
+        if champion_score(dice) is None:
+            return
+        self.champion_sequence += 1
+        self.champion_records.append({"sequence": self.champion_sequence,
+            "time": (time_text.strip() or "未知时间") if time_text is not None else utc_now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "dice": list(dice), "title": title if title.strip() else classify_dice(dice).title})
+        # 排序与裁切都只操作独立榜单，不删除或改动普通博饼记录。
+        self.champion_records.sort(key=lambda row: (champion_score(row["dice"]), row["sequence"]), reverse=True)
+        self.champion_records = self.champion_records[:50]
+
+    def add_bounty(self, task: str, rolls: int) -> WorkBounty:
+        bounty = WorkBounty(uuid.uuid4().hex, task.strip() if isinstance(task, str) else task, rolls)
+        bounty.validate()
+        self.pending_bounties.append(bounty)
+        return bounty
+
+    def remove_bounty(self, identifier: str, *, completed: bool = False) -> WorkBounty:
+        for index, bounty in enumerate(self.pending_bounties):
+            if bounty.id == identifier:
+                bounty.validate(allow_legacy=True)
+                if completed:
+                    self.work.bounty_earned += bounty.rolls
+                # 完成或删除都立即移除；不保存已完成任务，避免重复领取。
+                return self.pending_bounties.pop(index)
+        raise ValueError("该悬赏任务已完成或已删除，不能重复领取。")
 
     def award(self, dice: list[int]) -> dict:
+        if self.pending_choices:
+            raise ValueError("请先选择并领取本次奖品，再进行下一次博饼。")
         result = classify_dice(dice, self.rules)
+        for category, _count in result.awards:
+            self.prizes[category].validate()
         granted, depleted = [], []
+        choices = []
         for category, requested in result.awards:
             count = (requested if self.rules.allow_negative_stock
                      else min(requested, max(0, self.remaining[category])))
             if count:
                 prize = self.prizes[category]
                 self.remaining[category] -= count
-                if prize.minutes == 0:
-                    self.item_balances.setdefault(prize.activity, ItemBalance()).earned += count
+                details = prize.option_details
+                if len(details) > 1:
+                    choices.append({"id": uuid.uuid4().hex, "roll_number": self.roll_count + 1,
+                        "category": category, "options": [name for name, amount in details],
+                        "minutes": details[0][1], "option_minutes": [amount for name, amount in details], "count": count})
                 else:
-                    balance = self.balances.setdefault(prize.activity, Balance())
-                    balance.earned_ms += prize.minutes * count * 60000
-                    balance.wins += count
-                granted.append({"category": category, "activity": prize.activity,
-                                "minutes": prize.minutes * count, "count": count})
+                    name, amount = details[0]
+                    granted.append(self._deliver_reward(category, name, amount, count))
             if count < requested:
                 depleted.append(category + ("库存不足" if count else "已领完"))
         self.roll_count += 1
         row = {"number": self.roll_count, "time": datetime.now().strftime("%H:%M:%S"),
                "dice": list(dice), "title": result.title, "explanation": result.explanation,
-               "granted": granted, "depleted": depleted}
+               "granted": granted, "depleted": depleted, "pending": [choice["category"] for choice in choices]}
+        self.pending_choices = choices
         self.history.append(row)
+        self._record_champion(dice, result.title)
         # 保留最近 3000 条记录；余额及当前局掷骰总次数不受此限制影响。
         self.history = self.history[-3000:]
+        return row
+
+    def _deliver_reward(self, category: str, name: str, minutes, count: int) -> dict:
+        reward = {"category": category, "activity": name, "minutes": 0, "count": count}
+        if category == "安慰奖" and name == "再来一次" and minutes == 0:
+            self.work.prize_earned += count
+            reward.update(kind="chance", quantity=count)
+        elif minutes < 1:
+            amount = number_from_tenths((10 if minutes == 0 else quantity_tenths(minutes)) * count)
+            self.item_balances.setdefault(name, ItemBalance()).add(amount)
+            reward.update(kind="item", quantity=amount)
+        else:
+            balance = self.balances.setdefault(name, Balance())
+            balance.earned_ms += int(minutes) * count * 60000
+            balance.wins += count
+            reward.update(kind="time", minutes=int(minutes) * count)
+        return reward
+
+    def choose_reward(self, identifier: str, selection: str | int) -> dict:
+        choice = next((entry for entry in self.pending_choices if entry["id"] == identifier), None)
+        if choice is None:
+            raise ValueError("该奖励已领取或不存在，不能重复领取。")
+        if type(selection) is int:
+            index = selection
+        elif isinstance(selection, str) and choice["options"].count(selection) == 1:
+            index = choice["options"].index(selection)
+        else:
+            raise ValueError("请从本次奖品选项中明确选择一项。")
+        if not 0 <= index < len(choice["options"]):
+            raise ValueError("请从本次奖品选项中选择一项。")
+        name = choice["options"][index]
+        amounts = choice.get("option_minutes", [choice["minutes"]] * len(choice["options"]))
+        row = next((entry for entry in reversed(self.history) if entry["number"] == choice["roll_number"]), None)
+        if row is None:
+            raise ValueError("待领奖励对应的博饼记录不存在。")
+        reward = self._deliver_reward(choice["category"], name, amounts[index], choice["count"])
+        row["granted"].append(reward)
+        row["pending"].remove(choice["category"])
+        self.pending_choices.remove(choice)
         return row
 
     def configure(self, prizes: dict[str, Prize], rules: Rules) -> None:
@@ -1509,20 +1841,23 @@ class Game:
 
     def restart(self) -> None:
         """只重置本局库存和博饼记录，奖励余额、计时与工作账户均保留。"""
+        if self.pending_choices:
+            raise ValueError("请先选择并领取待选奖品，再重新开始博饼。")
         self.remaining = {c: self.prizes[c].stock for c in CATEGORIES}
         self.history.clear()
         self.roll_count = 0
 
-    def claim_item(self, name: str, count: int) -> None:
+    def claim_item(self, name: str, count: int | float) -> None:
         """记录实际领取的物品；库存已在中奖时扣减，这里只扣待领取件数。"""
-        if type(count) is not int or count <= 0:
-            raise ValueError("领取件数必须是大于零的整数。")
+        units = quantity_tenths(count)
+        if units <= 0:
+            raise ValueError("领取数量须大于零，最多保留一位小数。")
         balance = self.item_balances.get(name)
         if balance is None:
             raise ValueError("请先选择一项物品奖励。")
-        if count > balance.available:
-            raise ValueError(f"该物品只剩 {balance.available} 件待领取。")
-        balance.claimed += count
+        if units > quantity_tenths(balance.available):
+            raise ValueError(f"该物品只剩 {item_quantity_text(balance.available)}待领取。")
+        balance.claim(count)
 
     def withdraw_time(self, activity: str, count: int) -> None:
         if type(count) is not int or count <= 0:
@@ -1566,7 +1901,10 @@ class Game:
                 "balances": {a: asdict(b) for a, b in self.balances.items()},
                 "item_balances": {a: asdict(b) for a, b in self.item_balances.items()},
                 "history": self.history, "roll_count": self.roll_count, "session": self.session,
-                "work": asdict(self.work), "activity_timeline": self.activity_timeline, "task_options": self.task_options}
+                "work": asdict(self.work), "activity_timeline": self.activity_timeline, "task_options": self.task_options,
+                "pending_bounties": [asdict(bounty) for bounty in self.pending_bounties],
+                "pending_choices": self.pending_choices,
+                "champion_records": self.champion_records, "champion_sequence": self.champion_sequence}
 
     @classmethod
     def from_dict(cls, data: dict) -> Game:
@@ -1579,6 +1917,19 @@ class Game:
                 game.task_options = TaskCatalog(game.task_options).to_list()
             game.work = WorkCredits(**data.get("work", {}))
             game.work.validate()
+            pending = data.get("pending_bounties", [])
+            if not isinstance(pending, list):
+                raise ValueError("悬赏任务列表无效。")
+            identifiers = set()
+            for row in pending:
+                if not isinstance(row, dict):
+                    raise ValueError("悬赏任务数据无效。")
+                bounty = WorkBounty(**row)
+                bounty.validate(allow_legacy=True)
+                if bounty.id in identifiers:
+                    raise ValueError("悬赏任务标识重复。")
+                identifiers.add(bounty.id)
+                game.pending_bounties.append(bounty)
             game.activity_timeline = data.get("activity_timeline")
             if game.activity_timeline is not None:
                 timeline = ActivityTimeline.from_dict(game.activity_timeline, TaskCatalog(game.task_options))
@@ -1627,9 +1978,9 @@ class Game:
             for name, balance in game.item_balances.items():
                 if not isinstance(name, str) or not name.strip():
                     raise ValueError("物品名称无效。")
-                if any(type(v) is not int or v < 0 for v in asdict(balance).values()):
-                    raise ValueError("物品奖励数量无效。")
-                if balance.claimed > balance.earned:
+                for value in asdict(balance).values():
+                    quantity_tenths(value)
+                if quantity_tenths(balance.claimed) > quantity_tenths(balance.earned):
                     raise ValueError("已领取件数超过累计获得件数。")
             game.roll_count = data["roll_count"]
             if type(game.roll_count) is not int or game.roll_count < 0:
@@ -1647,8 +1998,77 @@ class Game:
                     if (reward["category"] not in CATEGORIES or not isinstance(reward["activity"], str)
                             or type(reward["minutes"]) is not int or type(reward["count"]) is not int):
                         raise ValueError("历史奖励无效。")
+                    kind = reward.get("kind", "item" if reward["minutes"] == 0 else "time")
+                    if kind not in ("item", "time", "chance") or reward["count"] <= 0 or reward["minutes"] < 0:
+                        raise ValueError("历史奖励类型无效。")
+                    if kind in ("item", "chance") and quantity_tenths(reward.get("quantity", reward["count"])) <= 0:
+                        raise ValueError("历史奖励数量无效。")
+                    if kind == "chance" and (reward["category"] != "安慰奖" or reward["activity"] != "再来一次"
+                            or reward["minutes"] != 0 or reward.get("quantity") != reward["count"]):
+                        raise ValueError("历史博饼机会奖励无效。")
                 if any(not isinstance(v, str) for v in row["depleted"]):
                     raise ValueError("历史库存记录无效。")
+            game.pending_choices = data.get("pending_choices", [])
+            if not isinstance(game.pending_choices, list):
+                raise ValueError("待选奖品记录无效。")
+            choice_ids, pending_categories = set(), set()
+            for choice in game.pending_choices:
+                if not isinstance(choice, dict):
+                    raise ValueError("待选奖品格式无效。")
+                identifier, category, options = choice["id"], choice["category"], choice["options"]
+                if (not isinstance(identifier, str) or not identifier or identifier in choice_ids
+                        or category not in CATEGORIES or category in pending_categories
+                        or type(choice["roll_number"]) is not int or choice["roll_number"] != game.roll_count
+                        or not game.history or game.history[-1]["number"] != choice["roll_number"]
+                        or not isinstance(options, list) or not 2 <= len(options) <= 3):
+                    raise ValueError("待选奖品记录不一致。")
+                for option in options:
+                    if not isinstance(option, str) or not option.strip() or option != option.strip() or len(option) > 80:
+                        raise ValueError("待选奖品内容无效。")
+                Prize(options[0], choice["minutes"], 0).validate()
+                amounts = choice.get("option_minutes", [choice["minutes"]] * len(options))
+                if not isinstance(amounts, list) or len(amounts) != len(options):
+                    raise ValueError("待选奖品的数量记录无效。")
+                for name, amount in zip(options, amounts):
+                    Prize(name, amount, 0).validate()
+                if amounts[0] != choice["minutes"] or len(set(zip(options, amounts))) != len(options):
+                    raise ValueError("待选奖品数量不一致或选项重复。")
+                if type(choice["count"]) is not int or not 1 <= choice["count"] <= 100000:
+                    raise ValueError("待选奖品份数无效。")
+                if any(reward["category"] == category for reward in game.history[-1]["granted"]):
+                    raise ValueError("同一奖品不能重复发放。")
+                choice_ids.add(identifier)
+                pending_categories.add(category)
+            for index, row in enumerate(game.history):
+                pending = row.get("pending", [])
+                expected = pending_categories if index == len(game.history) - 1 else set()
+                if (not isinstance(pending, list) or any(not isinstance(value, str) for value in pending)
+                        or len(pending) != len(set(pending)) or set(pending) != expected):
+                    raise ValueError("历史记录与待选奖品不一致。")
+            if "champion_records" not in data:
+                # 首次打开旧存档时，仅补入当前仍保留的状元记录；原博饼记录保持原样。
+                for row in game.history:
+                    game._record_champion(row["dice"], row["title"], row["time"])
+            else:
+                records = data["champion_records"]
+                if not isinstance(records, list) or len(records) > 50:
+                    raise ValueError("状元记录须为最多 50 条的列表。")
+                sequences = set()
+                for record in records:
+                    if not isinstance(record, dict):
+                        raise ValueError("状元记录格式无效。")
+                    sequence = record["sequence"]
+                    if (type(sequence) is not int or sequence <= 0 or sequence in sequences
+                            or not isinstance(record["time"], str) or not record["time"].strip()
+                            or not isinstance(record["title"], str) or not record["title"].strip()
+                            or champion_score(record["dice"]) is None):
+                        raise ValueError("状元记录内容无效。")
+                    sequences.add(sequence)
+                game.champion_sequence = data.get("champion_sequence", max(sequences, default=0))
+                if type(game.champion_sequence) is not int or game.champion_sequence < max(sequences, default=0):
+                    raise ValueError("状元记录的先后次序无效。")
+                game.champion_records = copy.deepcopy(records)
+                game.champion_records.sort(key=lambda row: (champion_score(row["dice"]), row["sequence"]), reverse=True)
             game.session = data.get("session")
             if game.session is not None:
                 session = game.session
@@ -1721,11 +2141,31 @@ def timer_digits(milliseconds: int) -> str:
 
 
 def reward_text(row: dict) -> str:
-    messages = [f"{r['category']}：{r['activity']} +{r['count']}件" if r["minutes"] == 0
-                else f"{r['category']}：{r['activity']} +{r['minutes']}分钟"
-                + (f"（{r['count']}份）" if r["count"] > 1 else "") for r in row["granted"]]
+    messages = []
+    for reward in row["granted"]:
+        kind = reward.get("kind", "item" if reward["minutes"] == 0 else "time")
+        if kind == "chance":
+            amount = f"{reward.get('quantity', reward['count'])}次博饼机会"
+        elif kind == "item":
+            amount = item_quantity_text(reward.get("quantity", reward["count"]))
+        else:
+            amount = f"{reward['minutes']}分钟" + (f"（{reward['count']}份）" if reward["count"] > 1 else "")
+        messages.append(f"{reward['category']}：{reward['activity']} +{amount}")
+    messages.extend(f"{category}：待选择奖品" for category in row.get("pending", []))
     messages.extend(row["depleted"])
     return "；".join(messages) or "本次没有奖励"
+
+
+def prize_option_text(category: str, name: str, amount) -> str:
+    if category == "安慰奖" and amount == 0 and name == "再来一次":
+        return name + " · +1次博饼机会"
+    quantity = item_quantity_text(1 if amount == 0 else amount) if amount < 1 else f"{format_quantity(amount)}分钟"
+    return name + " · " + quantity
+
+
+def prize_summary(category: str, prize: Prize) -> str:
+    details = prize.option_details
+    return " / ".join(prize_option_text(category, name, amount) for name, amount in details) + ("（任选一项）" if len(details) > 1 else "")
 
 
 class BobingApp:
@@ -1787,6 +2227,7 @@ class BobingApp:
             self._show_result(game.history[-1])
             self._draw_dice(game.history[-1]["dice"])
             self.manual_dice_var.set("".join(map(str, game.history[-1]["dice"])))
+        self._refresh_choice_controls()
         if game.session:
             self.status.set("已恢复上次的倒计时，当前为暂停状态；关闭程序期间不扣时间。")
         self._refresh_timer()
@@ -1826,6 +2267,8 @@ class BobingApp:
         style.map("Accent.TButton", background=[("active", "#8d3026"), ("disabled", "#d4b9b2")])
         style.configure("Green.TButton", background=self.GREEN, foreground="white", borderwidth=0)
         style.map("Green.TButton", background=[("active", "#1c5143"), ("disabled", "#a9bdb5")])
+        style.configure("Choice.Green.TButton", padding=self.px((10, 3)))
+        style.configure("Choice.TCombobox", padding=self.px(3))
         style.configure("TEntry", padding=self.px(5))
         style.configure("TSpinbox", padding=self.px(5))
         style.configure("TNotebook", background=self.BG, borderwidth=0)
@@ -1920,7 +2363,7 @@ class BobingApp:
         actions.pack(side="left", padx=self.px((14, 0)), fill="y")
         self.random_button = ttk.Button(actions, text="随机掷骰并领奖", style="Accent.TButton", command=self.random_roll)
         self.random_button.pack(fill="x", pady=self.px((4, 7)))
-        ttk.Label(actions, text="随机结果会立即判定并领奖", style="CardMuted.TLabel").pack(pady=self.px((7, 0)))
+        ttk.Label(actions, text="随机判定；多选奖品需确认领取", style="CardMuted.TLabel").pack(pady=self.px((7, 0)))
         manual = ttk.Frame(roll, style="Card.TFrame")
         manual.pack(fill="x", pady=self.px((12, 0)))
         ttk.Label(manual, text="手动输入", style="Card.TLabel").pack(side="left")
@@ -1938,6 +2381,10 @@ class BobingApp:
         ttk.Label(result, textvariable=self.result_title, style="Result.TLabel").pack(anchor="w")
         self.detail_label = ttk.Label(result, textvariable=self.result_detail, style="CardMuted.TLabel", wraplength=self.px(1040))
         self.detail_label.pack(anchor="w", fill="x", pady=self.px((5, 0)))
+        self.choice_frame = ttk.Frame(result, style="Card.TFrame")
+        self.choice_vars = {}
+        self.choice_boxes = {}
+        self.choice_buttons = {}
         result.bind("<Configure>", lambda event: self.detail_label.configure(
             wraplength=max(self.px(400), event.width - self.px(40))))
         lower = ttk.Frame(self.play_tab)
@@ -1991,16 +2438,17 @@ class BobingApp:
         item_controls.pack(fill="x", pady=self.px((12, 0)))
         ttk.Label(item_controls, text="本次领取", style="Card.TLabel").pack(side="left")
         self.claim_count = tk.StringVar(value="1")
-        ttk.Spinbox(item_controls, from_=1, to=100000, width=6,
-                    textvariable=self.claim_count).pack(side="left", padx=self.px(8))
-        ttk.Label(item_controls, text="件", style="Card.TLabel").pack(side="left")
+        self.claim_spinbox = ttk.Spinbox(item_controls, from_=0.1, to=100000, increment=0.1, width=6,
+                    textvariable=self.claim_count)
+        self.claim_spinbox.pack(side="left", padx=self.px(8))
+        ttk.Label(item_controls, text="件 / 份", style="Card.TLabel").pack(side="left")
         self.claim_button = ttk.Button(item_controls, text="已领取奖励", style="Green.TButton",
                                        command=self.claim_items)
         self.claim_button.pack(side="left", padx=self.px((12, 0)))
         self.item_hint = tk.StringVar()
         ttk.Label(self.item_rewards_tab, textvariable=self.item_hint, style="CardMuted.TLabel",
                   wraplength=self.px(610)).pack(anchor="w", fill="x", pady=self.px((10, 0)))
-        ttk.Label(self.item_rewards_tab, text="物品按件领取，时间奖励一件等于一分钟。\n点击按钮立即扣除，已自行使用的时间无需再倒计时。",
+        ttk.Label(self.item_rewards_tab, text="物品可按 0.1 份领取；时间奖励须按整数领取，一件等于一分钟。\n点击按钮立即扣除，已自行使用的时间无需再倒计时。",
                   style="CardMuted.TLabel", wraplength=self.px(610)).pack(anchor="w", fill="x", pady=self.px((10, 0)))
         self.reward_tabs.select(self.item_rewards_tab)
 
@@ -2038,24 +2486,43 @@ class BobingApp:
         self.config_canvas.bind("<Configure>", lambda event: self.config_canvas.itemconfigure(
             window, width=event.width))
         ttk.Label(content, text="给每个奖项设置时间奖励或物品奖励", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(content, text="分钟为 0：每中奖一份获得一件物品；分钟大于 0：获得对应时长。库存均减 1，同名同类奖励会自动累加。",
-                  style="Muted.TLabel").pack(anchor="w", pady=self.px((8, 18)))
+        instruction = WrappingParagraph(content,
+            "每个奖品分别设置内容及分钟 / 份数。0：一件物品；0.1～0.9：相应份数的物品；1 以上：整数分钟。同一奖项至少填一个内容，中奖后任选一项，库存减 1。", self)
+        instruction.pack(fill="x", pady=self.px((8, 18)))
         table = self._card(content)
         table.pack(fill="x")
-        headings = ("奖项", "奖品内容（文字）", "分钟（0 为物品）", "初始份数（整数）", "当前剩余")
+        headings = ("奖项", "奖品1", "分钟/份数1", "奖品2", "分钟/份数2", "奖品3", "分钟/份数3", "初始份数", "当前剩余")
         for index, heading in enumerate(headings):
-            ttk.Label(table, text=heading, style="Section.TLabel").grid(row=0, column=index, sticky="w", padx=self.px(10), pady=self.px((0, 10)))
-        table.columnconfigure(1, weight=1)
+            ttk.Label(table, text=heading, style="Section.TLabel").grid(row=0, column=index, sticky="w", padx=self.px(5), pady=self.px((0, 10)))
+        for column in (1, 3, 5):
+            table.columnconfigure(column, weight=1, uniform="prize_content")
         self.config_vars = {}
+        self.config_alternatives = {}
+        self.config_amounts = {}
+        self.config_name_entries = {}
+        self.config_amount_entries = {}
         self.config_remaining = {}
         for row, category in enumerate(CATEGORIES, 1):
-            ttk.Label(table, text=category, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=self.px(10), pady=self.px(8))
+            ttk.Label(table, text=category, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=self.px(5), pady=self.px(8))
             variables = tuple(tk.StringVar() for _ in range(3))
             self.config_vars[category] = variables
-            for column, (variable, width) in enumerate(zip(variables, (30, 12, 12)), 1):
-                ttk.Entry(table, textvariable=variable, width=width).grid(row=row, column=column, sticky="ew", padx=self.px(10), pady=self.px(8))
+            alternative_vars = tuple(tk.StringVar() for _ in range(2))
+            self.config_alternatives[category] = alternative_vars
+            amounts = (variables[1], tk.StringVar(), tk.StringVar())
+            self.config_amounts[category] = amounts
+            name_entries, amount_entries = [], []
+            for index, (name_var, amount_var) in enumerate(zip((variables[0], *alternative_vars), amounts)):
+                name_entry = ttk.Entry(table, textvariable=name_var, width=9)
+                name_entry.grid(row=row, column=1 + index * 2, sticky="ew", padx=self.px(5), pady=self.px(8))
+                amount_entry = ttk.Entry(table, textvariable=amount_var, width=6)
+                amount_entry.grid(row=row, column=2 + index * 2, sticky="ew", padx=self.px(5), pady=self.px(8))
+                name_entries.append(name_entry)
+                amount_entries.append(amount_entry)
+            self.config_name_entries[category] = name_entries
+            self.config_amount_entries[category] = amount_entries
+            ttk.Entry(table, textvariable=variables[2], width=7).grid(row=row, column=7, sticky="ew", padx=self.px(5), pady=self.px(8))
             self.config_remaining[category] = tk.StringVar()
-            ttk.Label(table, textvariable=self.config_remaining[category], style="CardMuted.TLabel").grid(row=row, column=4, sticky="w", padx=self.px(10))
+            ttk.Label(table, textvariable=self.config_remaining[category], style="CardMuted.TLabel").grid(row=row, column=8, sticky="w", padx=self.px(5))
         options = ttk.LabelFrame(content, text="奖品发放规则", padding=self.px(14))
         options.pack(fill="x", pady=self.px(16))
         self.rule_vars = {key: tk.BooleanVar() for key in asdict(self.game.rules)}
@@ -2069,7 +2536,9 @@ class BobingApp:
         ttk.Button(buttons, text="保存设置", style="Accent.TButton", command=self.save_config).pack(side="left")
         ttk.Button(buttons, text="撤销未保存的编辑", command=self._load_form).pack(side="left", padx=self.px(10))
         ttk.Label(content, text="保存后保留本局已领取份数；增加初始份数会增加剩余库存。插金花类共用「插金花」库存。\n"
-                  "改名或切换奖励类型只影响今后的奖励，已获得的时间和物品不变。要重新补满库存，请点击右上角「重新开始博饼」。",
+                  "每个奖品的分钟 / 物品份数独立设置；内容可以留空一栏或两栏，空栏对应的数量无需填写。多个选项中奖后择一，库存按奖项共用。\n"
+                  "安慰奖内容为「再来一次」且分钟为 0：直接增加一次博饼机会，不加入物品栏。\n"
+                  "修改设置只影响今后的奖励，已获得和待选择的奖励保持原值。要重新补满库存，请点击右上角「重新开始博饼」。",
                   style="Muted.TLabel", wraplength=self.px(1000)).pack(anchor="w", pady=self.px(14))
 
         def scroll(event):
@@ -2086,9 +2555,28 @@ class BobingApp:
         bind_scroll(self.config_canvas)
 
     def _build_history(self) -> None:
-        ttk.Label(self.history_tab, text="本局博饼记录（最多保留最近 3000 次）", style="Muted.TLabel").pack(anchor="w", pady=self.px((0, 10)))
-        self.history_tree = self._tree(self.history_tab, ("number", "time", "dice", "result", "reward"),
-                                       ("次数", "时间", "六颗骰子", "奖品类别", "领取结果"), (55, 80, 135, 180, 550), height=16)
+        self.champion_section = self._card(self.history_tab)
+        self.champion_section.pack(fill="x", pady=self.px((0, 12)))
+        ttk.Label(self.champion_section, text="状元记录", style="Section.TLabel").pack(anchor="w")
+        self.champion_count_var = tk.StringVar()
+        ttk.Label(self.champion_section, textvariable=self.champion_count_var, style="CardMuted.TLabel").pack(
+            anchor="w", pady=self.px((4, 8)))
+        self.champion_tree = self._tree(self.champion_section, ("rank", "time", "dice", "result", "detail"),
+            ("名次", "时间", "六颗骰子", "状元类别", "比较点数"), (55, 180, 160, 200, 300), height=8)
+
+        def scroll_champions(event):
+            if event.delta:
+                units = max(1, int(abs(event.delta) / 120))
+                self.champion_tree.yview_scroll(-units if event.delta > 0 else units, "units")
+            return "break"
+
+        self.champion_tree.bind("<MouseWheel>", scroll_champions)
+        self.history_section = self._card(self.history_tab)
+        self.history_section.pack(fill="both", expand=True)
+        ttk.Label(self.history_section, text="本局博饼记录（最多保留最近 3000 次）", style="Section.TLabel").pack(
+            anchor="w", pady=self.px((0, 10)))
+        self.history_tree = self._tree(self.history_section, ("number", "time", "dice", "result", "reward"),
+            ("次数", "时间", "六颗骰子", "奖品类别", "领取结果"), (55, 80, 135, 180, 550), height=6)
 
     def _build_rules(self) -> None:
         text = tk.Text(self.rules_tab, wrap="word", bg=self.CARD, fg=self.INK, relief="flat",
@@ -2110,7 +2598,7 @@ class BobingApp:
                     "四进带一秀 / 二举以及五子带一秀默认开启，可在奖品设置中开关。\n"
                     "安慰奖位于奖品列表末尾，默认库存 999 份，可修改内容、分钟和份数。"
                     "默认关闭；在奖品设置中勾选「启用安慰奖」并保存后，未博中其他奖项时获得一份安慰奖。"
-                    "已有奖项库存不足时不改发安慰奖；安慰奖同样按库存规则发放，分钟为 0 时按件计入物品奖励。\n"
+                    "已有奖项库存不足时不改发安慰奖；安慰奖同样按库存规则发放。内容为「再来一次」且分钟为 0 时，直接增加一次博饼机会，不加入物品栏；其他物品正常计入余额。\n"
                     "兼得的每个奖项分别扣库存；其中一个领完，不影响另一个领取。默认限制库存，为 0 时显示类别，但不增加时间或物品奖励。\n\n"
                     "可勾选「允许超出库存领奖」，保存后库存为 0 或负数仍照常发奖。"
                     "例如一秀库存为 0，再博到一秀会获得对应时间或一件物品，库存减为 -1；再次获得则为 -2。"
@@ -2119,14 +2607,23 @@ class BobingApp:
                     "单人时间与物品奖励玩法\n"
                     "本程序中奖后立即发放奖励，不进行多人状元比大小、追夺奖品或六勃扫奖池。"
                     "各种状元组合共用「状元」库存；每次六同领取一份状元和一份插金花。不同地方的传统玩法可能不同。\n\n"
+                    "状元记录\n"
+                    "博饼记录页顶部是独立的状元记录，最多保留排名最高的 50 条，列表约显示 8 条，可用滚轮或滚动条查看其他记录。"
+                    "从大到小为：插金花、六勃红、遍地锦、六勃黑、五红、五子、四红。六勃黑比同点数字；五红比余下单骰；五子先比五颗同点数字，再比余下单骰；四红比余下两骰之和。"
+                    "同样大的记录按新到旧排列，满 50 条时淘汰最小且最旧的记录；更小的新记录不入榜。"
+                    "重新开始博饼不会清空状元记录。库存不足时博到状元也会记录；下方本局记录仍照常记录状元，不受榜单影响。"
+                    "首次打开旧存档时，会从仍保留的本局记录中补入状元；旧记录沿用原来的时间。\n\n"
                     "配置与使用\n"
-                    "每个奖项的三个输入框依次为：奖品内容、每次奖励分钟、初始份数。分钟大于 0 时表示时间奖励，分钟为 0 时表示物品奖励，每中奖一份获得一件。份数是本局可发放次数。\n"
+                    "每个奖项最多设置三个奖品，每个内容右侧有独立的分钟 / 物品份数。可以在同一奖项中同时设置时间奖励和物品奖励。库存仍按奖项共用。至少填写一栏，也可以只填第二栏或第三栏。"
+                    "只有一个非空内容时立即发奖，有两三个不同内容时在掷骰结果区域选择一项并确认领奖；选完全部奖项后才能再次掷骰或重新开始博饼。"
+                    "中奖时已扣除该奖项的一份库存，选择时不再扣库存。待选内容与数量会保存，后续修改设置不影响本次待选奖励。\n"
+                    "分钟为 0 表示一件物品；0.1～0.9 表示相应份数的物品，例如 0.5 表示半份；1 以上须为整数，表示时间分钟。初始份数仍是本局可发放次数。\n"
                     "例如一秀设置为「看电视 / 2 / 32」，博到两次后剩 30 份，累计看电视 4 分钟。"
                     "二举也设为看电视时，奖励自动累加到同一个活动。\n"
                     "例如一秀设置为「饼干 / 0 / 32」，博到两次后剩 30 份，累计获得饼干 2 件。"
                     "同名物品按件累加，同名的时间奖励和物品奖励分别统计。"
                     "在博饼页「我的奖励 → 直接领取」中选择物品或时间奖励，填写领取件数，再点击「已领取奖励」。时间奖励一件等于一分钟。"
-                    "点击按钮会立即扣除剩余奖励，不再扣库存；已自行使用的时间无需再倒计时。两个奖励列表只展示剩余奖励。\n"
+                    "物品领取数量支持一位小数，时间奖励领取数量仍须为整数分钟。点击按钮会立即扣除剩余奖励，不再扣库存；已自行使用的时间无需再倒计时。两个奖励列表只展示剩余奖励。\n"
                     "手动掷骰只需一个输入框：连续输入六个 1～6 的数字（例如 111665），再点击「判定并领奖」或按回车。"
                     "也支持空格或逗号分隔。输入时不会自动领奖，判定后会选中全部内容，方便直接输入下一轮。\n"
                     "选择奖励后输入本次使用分钟，或点击「用完所选奖励」。只扣实际经过的时间，余额显示到秒。"
@@ -2134,15 +2631,21 @@ class BobingApp:
                     "重新开始只重置本局库存、掷骰结果和博饼记录，保留已获得的全部时间和物品奖励。奖励可通过填写领取份数使用。"
                     "重新开始不会打断奖励倒计时或工作计时，也不会重置累计工作时长和博饼机会。\n\n"
                     "工作计时与博饼机会\n"
-                    "工作计时页保留原工作计时软件的活动选择、清空选择、离席修正、当前/上一段时长、工作时长与日历导出。"
+                    "工作计时页支持活动选择、清空选择、当前/上一段时长、工作时长与日历导出。"
                     "点击「编辑任务列表」可修改任务名称、日历名称、工作属性、日历导出属性和顺序。任务保存在数据文件中，新目录默认只有工作和休闲。\n"
                     "默认每工作 25 分钟得到一次机会，可在工作计时页修改 X。未满 X 的零散时间与未用次数跨会话保存。"
                     "每次有效掷骰扣一次机会，包括未中奖或库存不足。无效输入不扣次数，兼得多个奖项仍只扣一次。"
                     "顶部可手动增加次数；重新开始博饼不清空工作时长和剩余机会。\n"
-                    "工作兑换区域的「重设」按钮会清零兑换工作时长、手动增加、累计使用次数及次数欠额，保留兑换分钟设置。"
-                    "活动记录、奖品和当前计时不受影响；从重设时刻重新累计工作，旧活动不会重新计入机会。\n"
+                    "工作悬赏\n"
+                    "输入待完成的任务及悬赏次数（1～99 的整数），点击「添加悬赏」。点击该任务的「完成」按钮才会发放对应次数并移除任务，不保留已完成任务。"
+                    "列表不使用内部滚动条，最多添加 7 条悬赏。新任务内容须能在当前列表宽度内单行完整显示，中英文按实际宽度校验。"
+                    "任务内容以只读文本展示，可用鼠标选择或 Ctrl+A 全选后按 Ctrl+C 复制，点击文字不会领奖。旧版已有的长任务、超出条数或次数上限的悬赏均保留。"
+                    "未完成任务会持续保存，关闭再打开、重新开始博饼或重设兑换统计后仍保留。点击任务旁的「删除」直接移除，不发放次数。"
+                    "悬赏获得的次数单独统计，不受兑换分钟或活动时间修改影响；如有次数欠额，先补回欠额。\n"
+                    "工作兑换区域位于活动事件列表下方。「重设」按钮会清零兑换工作时长、手动增加、悬赏获得、奖品获得、累计使用次数及次数欠额，保留兑换分钟设置。"
+                    "未完成悬赏、活动记录、奖品和当前计时不受影响；从重设时刻重新累计工作，旧活动不会重新计入机会。\n"
                     "修改 X 会按累计工作时间重新计算应得次数。离席修正会相应增加或扣回工作机会；"
-                    "如已经用掉被扣回的机会，会显示欠额，之后工作或手动添加先补回。已有奖品不追扣。\n"
+                    "如已经用掉被扣回的机会，会显示欠额，之后工作、完成悬赏或手动添加先补回。已有奖品不追扣。\n"
                     "活动事件显示中文与英文对应，支持编辑活动及起止时间、拆分为两段和恢复为未分配时间。"
                     "可以多次修改同一事件；两个事件之间、开始与结束处的空档会自动显示为未分配时间，双击即可补记。"
                     "未分配时间不计入工作，也不导出日历。所有修改会同步更新工作时长与博饼机会。\n"
@@ -2185,8 +2688,12 @@ class BobingApp:
     def _load_form(self) -> None:
         for category, variables in self.config_vars.items():
             prize = self.game.prizes[category]
-            for variable, value in zip(variables, (prize.activity, prize.minutes, prize.stock)):
+            for variable, value in zip(variables, (prize.activity, format_quantity(prize.minutes), prize.stock)):
                 variable.set(str(value))
+            for variable, value in zip(self.config_alternatives[category], prize.alternatives):
+                variable.set(value)
+            for variable, value in zip(self.config_amounts[category], prize.amounts):
+                variable.set(format_quantity(value))
         for key, variable in self.rule_vars.items():
             variable.set(getattr(self.game.rules, key))
 
@@ -2194,7 +2701,7 @@ class BobingApp:
         for category in CATEGORIES:
             prize = self.game.prizes[category]
             values = (category, f"{self.game.remaining[category]} / {prize.stock}",
-                      f"{prize.activity} · 1件" if prize.minutes == 0 else f"{prize.activity} {prize.minutes}分钟")
+                      prize_summary(category, prize))
             if self.stock_tree.exists(category):
                 self.stock_tree.item(category, values=values, tags=("negative",) if self.game.remaining[category] < 0 else ())
             else:
@@ -2229,7 +2736,7 @@ class BobingApp:
         rows = []
         for name, balance in self.game.item_balances.items():
             if balance.available > 0:
-                rows.append(("item:" + name, (name + "（物品）", f"{balance.available}件")))
+                rows.append(("item:" + name, (name + "（物品）", item_quantity_text(balance.available))))
         for name, balance in self.game.balances.items():
             if balance.available_ms > 0:
                 minutes = balance.available_ms // 60000
@@ -2272,7 +2779,10 @@ class BobingApp:
             available = (self.game.item_balances[name].available if kind == "item"
                          else self.game.balances[name].available_ms // 60000)
         self.claim_button.configure(state="normal" if available > 0 else "disabled")
-        self.item_hint.set(f"已选择：{reward[1]} · 可直接领取 {available} 件" if reward
+        if reward:
+            self.claim_spinbox.configure(from_=0.1 if reward[0] == "item" else 1,
+                                         increment=0.1 if reward[0] == "item" else 1)
+        self.item_hint.set(f"已选择：{reward[1]} · 可直接领取 {format_quantity(available)} 件 / 份" if reward
                            else "先获得奖励，再选择要直接领取的物品或时间。")
 
     def claim_items(self) -> None:
@@ -2282,9 +2792,9 @@ class BobingApp:
             return
         try:
             try:
-                count = int(self.claim_count.get().strip())
+                count = parse_decimal_number(self.claim_count.get())
             except ValueError:
-                raise ValueError("领取件数请填写大于零的整数。") from None
+                raise ValueError("物品数量须大于零且最多一位小数；时间奖励须填写整数分钟。") from None
             self._settle_timer(notify=False)
             kind, name = reward
             if kind == "item":
@@ -2300,7 +2810,8 @@ class BobingApp:
         self._refresh_balances()
         self._refresh_items()
         self._refresh_timer()
-        self.status.set(f"已直接领取：{name} {count} {'件' if kind == 'item' else '分钟'}。")
+        amount = item_quantity_text(count) if kind == "item" else f"{count}分钟"
+        self.status.set(f"已直接领取：{name} {amount}。")
         self._save()
 
 
@@ -2309,6 +2820,20 @@ class BobingApp:
         for row in reversed(self.game.history):
             self.history_tree.insert("", "end", values=(row["number"], row["time"], " ".join(map(str, row["dice"])),
                                                         row["title"], reward_text(row)))
+        self._refresh_champions()
+
+    def _refresh_champions(self) -> None:
+        selected = self.champion_tree.selection()
+        position = self.champion_tree.yview()[0]
+        self.champion_tree.delete(*self.champion_tree.get_children())
+        for rank, record in enumerate(self.game.champion_records, 1):
+            self.champion_tree.insert("", "end", iid=str(record["sequence"]), values=(rank, record["time"],
+                " ".join(map(str, record["dice"])), record["title"], champion_detail(record["dice"])))
+        for identifier in selected:
+            if self.champion_tree.exists(identifier):
+                self.champion_tree.selection_set(identifier)
+        self.champion_tree.yview_moveto(position)
+        self.champion_count_var.set(f"已保留 {len(self.game.champion_records)} / 50 条 · 同样大时新记录优先 · 重新开始博饼后保留")
 
     def selected_activity(self) -> str | None:
         selection = self.balance_tree.selection()
@@ -2322,7 +2847,62 @@ class BobingApp:
 
     def _show_result(self, row: dict) -> None:
         self.result_title.set(row["title"])
-        self.result_detail.set(row["explanation"] + "  " + reward_text(row))
+        self.result_detail.set(row["explanation"] + "  " + reward_text(row)
+            + ("；请选择并确认全部奖品后继续。" if row.get("pending") else ""))
+        self._refresh_choice_controls()
+
+    def _refresh_choice_controls(self) -> None:
+        previous = {key: variable.get() for key, variable in self.choice_vars.items()}
+        for child in self.choice_frame.winfo_children():
+            child.destroy()
+        self.choice_vars, self.choice_boxes, self.choice_buttons = {}, {}, {}
+        if not self.game.pending_choices:
+            self.choice_frame.pack_forget()
+            return
+        self.choice_frame.pack(fill="x", pady=self.px((6, 0)))
+        for choice in self.game.pending_choices:
+            row = ttk.Frame(self.choice_frame, style="Card.TFrame")
+            row.pack(fill="x", pady=self.px((4, 0)))
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=choice["category"], style="Card.TLabel", width=7).grid(row=0, column=0, sticky="w")
+            identifier = choice["id"]
+            selected = previous.get(identifier, "")
+            amounts = choice.get("option_minutes", [choice["minutes"]] * len(choice["options"]))
+            labels = [prize_option_text(choice["category"], name, amount) for name, amount in zip(choice["options"], amounts)]
+            variable = tk.StringVar(value=selected if selected in labels else "请选择奖品")
+            box = ttk.Combobox(row, textvariable=variable, values=labels, state="readonly", style="Choice.TCombobox")
+            box.grid(row=0, column=1, sticky="ew", padx=self.px((8, 10)))
+            button = ttk.Button(row, text="确认领奖", style="Choice.Green.TButton",
+                command=lambda key=identifier: self.confirm_reward_choice(key))
+            button.grid(row=0, column=2)
+            self.choice_vars[identifier], self.choice_boxes[identifier], self.choice_buttons[identifier] = variable, box, button
+
+    def confirm_reward_choice(self, identifier: str) -> bool:
+        variable = self.choice_vars.get(identifier)
+        if variable is None:
+            return False
+        game = self.game
+        # 只回滚领奖涉及的字段；保存时正常结算的工作时长继续保留。
+        previous = copy.deepcopy((game.balances, game.item_balances, game.pending_choices, game.history, game.work.prize_earned))
+        try:
+            row = game.choose_reward(identifier, self.choice_boxes[identifier].current())
+        except ValueError as error:
+            messagebox.showwarning("请选择奖品", str(error), parent=self.root)
+            return False
+        saved = self._save()
+        if not saved:
+            game.balances, game.item_balances, game.pending_choices, game.history, game.work.prize_earned = previous
+            row = game.history[-1]
+        self._refresh_chances()
+        self._refresh_balances()
+        self._refresh_items()
+        self._refresh_history()
+        self._show_result(row)
+        if saved:
+            self.status.set(reward_text(row) + ("；请继续选择其他奖项。" if game.pending_choices else "；已领取，可继续博饼。"))
+        else:
+            self.status.set("领奖未保存，已保留待选奖品；请修复保存问题后重试。")
+        return saved
 
     def random_roll(self) -> None:
         dice = [random.randint(1, 6) for _ in range(6)]
@@ -2343,6 +2923,9 @@ class BobingApp:
         return "break"
 
     def _roll(self, dice) -> bool:
+        if self.game.pending_choices:
+            messagebox.showinfo("请先选择奖品", "请在本次结果中选择并确认所有待领奖品，再继续博饼。", parent=self.root)
+            return False
         if self.tracker:
             self.tracker.refresh_time_displays()
         classify_dice(dice, self.game.rules)
@@ -2364,6 +2947,8 @@ class BobingApp:
         rows = self.history_tree.get_children()
         if len(rows) > 3000:
             self.history_tree.delete(rows[-1])
+        if champion_score(dice) is not None:
+            self._refresh_champions()
         self.status.set(f"第 {row['number']} 次：{reward_text(row)}")
         self._save()
         return True
@@ -2375,11 +2960,12 @@ class BobingApp:
         self.credit_detail_var.set(
             f"累计工作：{ActivityTrackerApp.format_activity_duration(credits.work_seconds)}\n"
             f"工作获得 {credits.earned} 次 · 手动增加 {credits.manual_added} 次\n"
+            f"悬赏获得 {credits.bounty_earned} 次 · 奖品获得 {credits.prize_earned} 次\n"
             f"累计使用 {credits.spent} 次（跨博饼局统计）")
         self.progress_var.set(
             f"再工作 {format_time(credits.seconds_to_next * 1000)}，获得 1 次机会。"
             + (f"当前还需补回 {-credits.available} 次。" if credits.available < 0 else ""))
-        state = "normal" if credits.available > 0 else "disabled"
+        state = "normal" if credits.available > 0 and not self.game.pending_choices else "disabled"
         self.random_button.configure(state=state)
         self.manual_button.configure(state=state)
         if self.tracker:
@@ -2412,8 +2998,8 @@ class BobingApp:
 
     def reset_work_credits(self) -> None:
         if not messagebox.askyesno("重设工作兑换统计",
-                "将累计兑换工作时长、手动增加次数、累计使用次数和次数欠额清零。\n"
-                "保留兑换分钟设置、活动记录、奖品和当前计时。\n"
+                "将累计兑换工作时长、手动增加次数、悬赏获得次数、奖品获得次数、累计使用次数和次数欠额清零。\n"
+                "保留兑换分钟设置、未完成悬赏、活动记录、奖品和当前计时。\n"
                 "从重设时刻开始重新累计工作，确定重设？", parent=self.root):
             return
         old_work = WorkCredits(**asdict(self.game.work))
@@ -2449,11 +3035,15 @@ class BobingApp:
 
     def save_config(self) -> None:
         try:
-            prizes = {category: Prize(v[0].get().strip(), int(v[1].get().strip()), int(v[2].get().strip()))
-                      for category, v in self.config_vars.items()}
+            prizes = {}
+            for category, variables in self.config_vars.items():
+                names = (variables[0].get().strip(), *(variable.get().strip() for variable in self.config_alternatives[category]))
+                amounts = tuple(parse_decimal_number(variable.get()) if name else 0
+                    for name, variable in zip(names, self.config_amounts[category]))
+                prizes[category] = Prize(names[0], amounts[0], int(variables[2].get().strip()), names[1:], amounts[1:])
             self.game.configure(prizes, Rules(**{key: variable.get() for key, variable in self.rule_vars.items()}))
         except ValueError as error:
-            messagebox.showwarning("设置未保存", f"{error}\n\n分钟和份数必须填写整数。", parent=self.root)
+            messagebox.showwarning("设置未保存", f"{error}\n\n分钟为 0、0.1～0.9 或正整数；初始份数须为整数。", parent=self.root)
             return
         self._refresh_stock()
         self._load_form()
@@ -2461,6 +3051,10 @@ class BobingApp:
         self._save()
 
     def restart_dialog(self) -> None:
+        if self.game.pending_choices:
+            self.tabs.select(self.play_tab)
+            messagebox.showinfo("请先选择奖品", "先选择并领取待选奖品，再重新开始博饼。", parent=self.root)
+            return
         dialog = tk.Toplevel(self.root)
         dialog.title("重新开始博饼")
         dialog.resizable(False, False)
